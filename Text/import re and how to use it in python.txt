@@ -1,0 +1,41 @@
+
+- import re :
+
+ 		is a Python statement that imports the re module, which stands for "regular expression." Regular expressions are a powerful tool for matching patterns in strings, and the re module provides a variety of functions to work with them.
+
+Key Concepts of the re Module
+Here are some key concepts and commonly used functions provided by the re module:
+
+Pattern Matching: Regular expressions allow you to define a search pattern. This pattern can be used to check if a string contains specific characters, words, or sequences.
+
+ ..مطابقة الأنماط: تتيح لك التعبيرات العادية تحديد نمط البحث. يمكن استخدام هذا النمط للتحقق مما إذا كانت السلسلة تحتوي على أحرف أو كلمات أو تسلسلات محددة.
+
+Functions in the re Module:
+
+re.search(pattern, string): Scans through the string looking for a location where the pattern matches. Returns a match object if found; otherwise, it returns None.
+re.match(pattern, string): Checks for a match only at the beginning of the string. Returns a match object if found; otherwise, it returns None.
+re.findall(pattern, string): Returns a list of all non-overlapping matches of the pattern in the string.
+re.sub(pattern, repl, string): Replaces occurrences of the pattern in the string with the specified replacement string (repl).
+re.split(pattern, string): Splits the string by the occurrences of the pattern.
+Regular Expression Syntax:
+
+.: Matches any character except a newline.
+^: Matches the start of a string.
+$: Matches the end of a string.
+*: Matches 0 or more repetitions of the preceding element.
++: Matches 1 or more repetitions of the preceding element.
+?: Matches 0 or 1 repetition of the preceding element.
+[ ]: Matches any single character within the brackets. For example, [abc] matches 'a', 'b', or 'c'.
+[a-z]: Matches any lowercase letter from 'a' to 'z'.
+\d: Matches any digit (equivalent to [0-9]).
+\w: Matches any alphanumeric character (equivalent to [a-zA-Z0-9_]).
+\s: Matches any whitespace character (spaces, tabs, etc.).
+{m,n}: Matches from m to n repetitions of the preceding element.
+
+
+Example:
+	if not re.search(r"[A-Za-z]", password):
+		The ( r ) before the string indicates that it is a raw string, meaning that backslashes are treated literally and not as escape characters.
+
+
+يشير الحرف (ار ) قبل السلسلة إلى أنها سلسلة أولية، مما يعني أنه يتم التعامل مع الخطوط المائلة العكسية حرفيًا وليس كأحرف هروب.

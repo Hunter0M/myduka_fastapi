@@ -1,0 +1,26 @@
+- The command for running the fastapi :
+	
+	1 - Build the API image:
+		- docker build -t <Your image name> .	
+	
+	2 - Create a Docker network for the application and database:
+		- docker network create <Name your network>
+
+	3 - Run PostgreSQL container:
+		- docker run -d --name myduka-db --network myduka-network -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=0777 -e POSTGRES_DB=myduka_api -p 5432:5432 postgres:15
+
+	4 - Run the FastAPI application:
+		- docker run -d ` --name myduka-api ` --network myduka-network ` -e POSTGRES_USER=postgres ` -e POSTGRES_PASSWORD=0777 ` -e POSTGRES_DB=myduka_api ` -e POSTGRES_HOST=myduka-db ` -p 8000:8000 ` -v ${PWD}/app/uploads:/code/app/uploads ` myduka-api
+
+
+	*** The command for running the docker-compose ***    
+		( docker-compose up -d )
+
+	*** Rebuild and start the services ***
+		( docker-compose up -d --build )
+
+	*** Stop and remove existing containers and volumes ***
+		( docker-compose down -v )
+
+	*** Check the logs ***
+		( docker-compose logs -f )

@@ -1,0 +1,58 @@
+# version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: myduka-api
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "0777"
+      POSTGRES_DB: myduka_api
+      POSTGRES_HOST: host.docker.internal
+      DATABASE_URL: "postgresql://postgres:0777@host.docker.internal:5432/myduka_api"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app/uploads:/code/app/uploads
+    extra_hosts:
+      - "host.docker.internal:host-gateway" 
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.0
+    container_name: cadvisor
+    ports:
+      - "8080:8080"
+    volumes:
+      - "/:/rootfs:ro"
+      - "/var/run:/var/run:ro"
+      - "/sys:/sys:ro"
+      - "/var/lib/docker/:/var/lib/docker:ro" 
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - C:/Users/alrda/Documents/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-storage:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+
+volumes:
+  uploads:
+  grafana-storage:
