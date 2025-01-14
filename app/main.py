@@ -1807,7 +1807,9 @@ def delete_vendor(vendor_id: int, db: Session = Depends(database.get_db)):
 #     db.refresh(new_stk_push)
 #     return new_stk_push
 
+
 # Start MPESA Routes >>
+
 @app.post("/stk-push", response_model=schemas.STKPushResponse)
 async def initiate_stk_push(
     transaction: schemas.STKPushCreate,
