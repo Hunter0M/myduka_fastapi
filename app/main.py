@@ -40,9 +40,9 @@ app = FastAPI(
     title="Inventory System API",
     description="API for managing inventory and sales",
     version="1.0.0",
-    openapi_url="openapi.json",
-    docs_url="docs",
-    redoc_url="redoc"
+    openapi_url="/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 models.Base.metadata.create_all(database.engine)
 
