@@ -1,9 +1,11 @@
 import requests
 from base64 import b64encode
 from datetime import datetime
-from app.mpesa_config import *
+from ..mpesa_config import *
 from fastapi import HTTPException
+from sqlalchemy.orm import Session
 from app import models
+from app import schemas
 
 # Get OAuth access token from Safaricom
 def get_access_token():
@@ -20,20 +22,13 @@ def get_access_token():
         
         url = f"{BASE_URL}/oauth/v1/generate?grant_type=client_credentials"
         
-        print("\n=== Auth Request Details ===")
-        print(f"URL: {url}")
-        print(f"Headers: {headers}")
         
         response = requests.get(
             url,
             headers=headers,
             timeout=30
         )
-        
-        print("\n=== Auth Response Details ===")
-        print(f"Status Code: {response.status_code}")
-        print(f"Response Body: {response.text}")
-        
+
         if response.status_code != 200:
             raise Exception(f"Auth failed: {response.status_code} - {response.text}")
             
@@ -134,10 +129,7 @@ async def initiate_stk_push_request(phone_number: str, amount: float, access_tok
 
         url = f"{BASE_URL}/mpesa/stkpush/v1/processrequest"
         
-        print("\n=== STK Push Request Details ===")
-        print(f"URL: {url}")
-        print(f"Headers: {headers}")
-        print(f"Payload: {payload}")
+        
 
         response = requests.post(
             url,
@@ -146,9 +138,6 @@ async def initiate_stk_push_request(phone_number: str, amount: float, access_tok
             timeout=30
         )
         
-        print("\n=== STK Push Response Details ===")
-        print(f"Status Code: {response.status_code}")
-        print(f"Response Body: {response.text}")
         
         if response.status_code != 200:
             error_msg = f"{response.status_code}: MPESA API error: {response.text}"
@@ -169,13 +158,55 @@ def check_transaction_status(merchant_request_id: str, checkout_request_id: str,
     """Check the status of an MPESATransaction"""
     transaction = db.query(models.MPESATransaction).filter(
         models.MPESATransaction.merchant_request_id == merchant_request_id,
-        models.MPESATransaction.checkout_request_id == checkout_request_id
-    ).first()
+        models.MPESATransaction.checkout_request_id == checkout_request_id).first()
     
     if not transaction:
-        return None
+        raise HTTPException(status_code=404, detail="Transaction not found")
     
     return transaction
+
+
+
+
+async def process_stk_push_callback(callback_data, db: Session):
+    from app.schemas import MPESACallback 
+    try:
+        # Check if the transaction exists
+        transaction = db.query(models.MPESATransaction).filter(
+            models.MPESATransaction.merchant_request_id == callback_data.merchant_request_id,
+            models.MPESATransaction.checkout_request_id == callback_data.checkout_request_id
+        ).first()
+        
+        if not transaction:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+        
+        # Update transaction status
+        if callback_data.result_code != "0":
+            transaction.status = models.MPESAStatus.FAILED
+            transaction.result_code = callback_data.result_code
+            transaction.result_desc = callback_data.result_desc
+            db.commit()
+            return {
+                "status": "failure",
+                "message": "Transaction failed",
+                "result_code": callback_data.result_code,
+                "result_desc": callback_data.result_desc
+            }
+        
+        # Success case
+        transaction.status = models.MPESAStatus.COMPLETED
+        transaction.result_code = callback_data.result_code
+        transaction.result_desc = callback_data.result_desc
+        db.commit()
+        return {
+            "status": "success",
+            "message": "Transaction completed"
+        }
+    
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
