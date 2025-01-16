@@ -40,9 +40,10 @@ app = FastAPI(
     title="Inventory System API",
     description="API for managing inventory and sales",
     version="1.0.0",
-    openapi_url="/openapi.json",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    openapi_version="3.1.0",  # Add this line
+    openapi_url="/api/openapi.json",  # Update paths to include /api prefix
+    docs_url="/api/docs",
+    redoc_url="/api/redoc"
 )
 models.Base.metadata.create_all(database.engine)
 
@@ -75,8 +76,8 @@ models.Base.metadata.create_all(database.engine)
 origins = [
     "http://localhost",
     "http://localhost:5173",
-    "https://www.inventorysystem.co.ke",
-    "https://inventorysystem.co.ke"
+    "https://inventorysystem.co.ke",
+    "https://www.inventorysystem.co.ke"
 ]
 
 app.add_middleware(
