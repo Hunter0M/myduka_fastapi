@@ -163,7 +163,7 @@ class Payment(Base):
 
 
 
-# First, create an Enum class
+#  Enum class
 class MPESAStatus(str, enum.Enum):
     PENDING = 'pending'
     COMPLETED = 'completed'

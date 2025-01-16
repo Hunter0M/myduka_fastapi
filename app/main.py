@@ -36,7 +36,14 @@ from app.utils.mpesa import *
 
 
 
-app = FastAPI()
+app = FastAPI(
+    title="Inventory System API",
+    description="API for managing inventory and sales",
+    version="1.0.0",
+    openapi_url="/api/openapi.json",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc"
+)
 models.Base.metadata.create_all(database.engine)
 
 # origins = [
@@ -1870,7 +1877,7 @@ async def initiate_stk_push(
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        print(f"STK Push error: {str(e)}")  # Add logging
+        print(f"STK Push error: {str(e)}")  
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1899,36 +1906,50 @@ async def check_stk_push_status(
 
 
 # Callback for the STK Push >>  
+
+
+
+
 @app.post("/stk-push/callback")
 async def stk_push_callback(
     callback_data: schemas.MPESACallback,
     db: Session = Depends(database.get_db)
 ):
-    try:
-        transaction = check_transaction_status(
-            callback_data.merchant_request_id,
-            callback_data.checkout_request_id,
-            db
-        )
-        
-        if not transaction:
-            raise HTTPException(status_code=404, detail="Transaction not found")
+    print("Received callback data:", callback_data) 
+    return await process_stk_push_callback(callback_data, db)
 
-        # Update transaction status
-        transaction.status = (
-            models.MPESAStatus.COMPLETED 
-            if callback_data.result_code == "0" 
-            else models.MPESAStatus.FAILED
-        )
-        transaction.result_code = callback_data.result_code
-        transaction.result_desc = callback_data.result_desc
-        
-        db.commit()
-        return {"status": "success"}
 
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+
+# @app.post("/stk-push/callback")
+# async def stk_push_callback(
+#     callback_data: schemas.MPESACallback,
+#     db: Session = Depends(database.get_db)
+# ):
+#     try:
+#         transaction = check_transaction_status(
+#             callback_data.merchant_request_id,
+#             callback_data.checkout_request_id,
+#             db
+#         )
+        
+#         if not transaction:
+#             raise HTTPException(status_code=404, detail="Transaction not found")
+
+#         # Update transaction status
+#         transaction.status = (
+#             models.MPESAStatus.COMPLETED 
+#             if callback_data.result_code == "0" 
+#             else models.MPESAStatus.FAILED
+#         )
+#         transaction.result_code = callback_data.result_code
+#         transaction.result_desc = callback_data.result_desc
+        
+#         db.commit()
+#         return {"status": "success"}
+
+#     except Exception as e:
+#         db.rollback()
+#         raise HTTPException(status_code=500, detail=str(e))
 
 # The end for the STK Push Routes <<
 

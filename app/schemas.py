@@ -473,23 +473,6 @@ class STKPushCheckResponse(BaseModel):
     status: Optional[str] = None
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class MPESACallback(BaseModel):
     merchant_request_id: str
     checkout_request_id: str
