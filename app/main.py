@@ -36,30 +36,22 @@ from app.utils.mpesa import *
 
 
 
-app = FastAPI(
-    title="Inventory System API",
-    description="API for managing inventory and sales",
-    version="1.0.0",
-    openapi_version="3.1.0",  # Add this line
-    openapi_url="/api/openapi.json",  # Update paths to include /api prefix
-    docs_url="/api/docs",
-    redoc_url="/api/redoc"
-)
+app = FastAPI()
 models.Base.metadata.create_all(database.engine)
 
-# origins = [
-#     "http://localhost:3000",  # Your React app URL
-#     "http://127.0.0.1:3000",
-#     "http://192.168.1.20:3000",
-# ]
+origins = [
+    "http://localhost:3000",  # Your React app URL
+    "http://127.0.0.1:3000",
+    "http://192.168.1.20:3000",
+]
 
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=origins,  # Don't use ["*"] when using credentials
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"]
-# )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 
 # app.add_middleware(
@@ -73,20 +65,20 @@ models.Base.metadata.create_all(database.engine)
 
 
 # Configure CORS
-origins = [
-    "http://localhost",
-    "http://localhost:5173",
-    "https://inventorysystem.co.ke",
-    "https://www.inventorysystem.co.ke"
-]
+# origins = [
+#     "http://localhost",
+#     "http://localhost:5173",
+#     "https://inventorysystem.co.ke",
+#     "https://www.inventorysystem.co.ke"
+# ]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=origins,
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
 
 
 @app.get("/")
