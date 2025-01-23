@@ -16,20 +16,14 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1  # 30 دقيقة
 REFRESH_TOKEN_EXPIRE_DAYS = 30  # 7 أيام
 
-# إعداد تشفير كلمة المرور
+# Create password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# إعداد تشفير JWT
 def get_password_hash(password: str) -> str:
-    """تشفير كلمة المرور"""
     return pwd_context.hash(password)
 
-
-
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """التحقق من صحة كلمة المرور"""
     return pwd_context.verify(plain_password, hashed_password)
-
 
 def authenticate_user(db: Session, email: str, password: str) -> Users | None:
     """التحقق من صحة بيانات المستخدم"""
@@ -40,12 +34,10 @@ def authenticate_user(db: Session, email: str, password: str) -> Users | None:
         return None
     return user
 
-
 def check_user(email):
     db = sessionLocal()
     user = db.query(Users).filter(Users.email == email).first()
     return user
-
 
 def create_access_token(data: dict) -> dict:
     """إنشاء access token"""
@@ -62,7 +54,6 @@ def create_access_token(data: dict) -> dict:
         "token": token,
         "expires_at": expire
     }
-
 
 def create_refresh_token(data: dict) -> dict:
     """إنشاء refresh token"""

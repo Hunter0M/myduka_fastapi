@@ -4,7 +4,8 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 import re
 from app.utils.mpesa import format_phone_number
-
+from enum import Enum
+from datetime import timedelta
 
 
 
@@ -15,6 +16,7 @@ class UserBase(BaseModel):
     first_name: str
     last_name: str
     phone: str
+    is_admin: bool = False
 
     @validator('phone')
     def validate_phone(cls, v):
@@ -46,16 +48,28 @@ class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
     phone: Optional[str] = None
     password: Optional[str] = None
+    company_role: Optional[str] = None
+
+    @validator('company_role')
+    def validate_company_role(cls, v):
+        if v:
+            valid_roles = ['owner', 'admin', 'staff']
+            if v.lower() not in valid_roles:
+                raise ValueError(f'Role must be one of: {", ".join(valid_roles)}')
+            return v.lower()
+        return v
 
     @validator('email')
     def validate_email(cls, v):
-        return v.lower().strip()
+        if v:
+            return v.lower().strip()
+        return v
 
     @validator('first_name', 'last_name')
     def validate_names(cls, v):
-        if not v.strip():
+        if v and not v.strip():
             raise ValueError("Name cannot be empty")
-        return v.strip()
+        return v.strip() if v else v
 
     @validator('phone')
     def validate_phone(cls, v):
@@ -69,23 +83,74 @@ class UserUpdate(BaseModel):
             raise ValueError('Password must be at least 6 characters')
         return v
 
-
 class UserLogin(BaseModel):
     """مخطط تسجيل الدخول"""
     email: EmailStr
     password: str
 
-class UserResponse(UserBase):
-    """مخطط استجابة بيانات المستخدم"""
+class UserResponse(BaseModel):
+    """مخطط استجابة بيانات المستخدم مع معلومات الشركة"""
     id: int
-    created_at: datetime  
-    updated_at: datetime | None = None     #
+    email: str
+    first_name: str
+    last_name: str
+    phone: str
+    is_admin: bool
+    company_role: Optional[str]
+    created_at: datetime
+    updated_at: Optional[datetime]
 
     class Config:
         from_attributes = True
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
+
+# New schema for user with detailed company info
+class UserWithCompany(UserResponse):
+    """مخطط المستخدم مع تفاصيل الشركة الكاملة"""
+    company: Optional['CompanyResponse'] = None
+
+    class Config:
+        from_attributes = True
+
+# New schema for user role in company
+class UserCompanyRole(BaseModel):
+    """مخطط دور المستخدم في الشركة"""
+    role: str = Field(..., description="User's role in the company (owner, admin, staff)")
+    permissions: list[str] = []
+
+    @validator('role')
+    def validate_role(cls, v):
+        valid_roles = ['owner', 'admin', 'staff']
+        if v.lower() not in valid_roles:
+            raise ValueError(f'Role must be one of: {", ".join(valid_roles)}')
+        return v.lower()
+    
+
+class UserCompanyAssignment(BaseModel):
+    """مخطط تعيين المستخدم للشركة"""
+    user_id: int
+    company_id: int
+    role: str = Field(..., description="User's role in the company")
+
+    @validator('role')
+    def validate_role(cls, v):
+        valid_roles = ['owner', 'admin', 'staff']
+        if v.lower() not in valid_roles:
+            raise ValueError(f'Role must be one of: {", ".join(valid_roles)}')
+        return v.lower()
+
+# New schema for company user list
+class CompanyUser(BaseModel):
+    """مخطط مستخدم الشركة"""
+    user_id: int
+    email: EmailStr
+    first_name: str
+    last_name: str
+    role: str
+    joined_at: datetime
+
+    class Config:
+        from_attributes = True
+
 
 class TokenResponse(BaseModel):
     """مخطط استجابة التوكن الكامل"""
@@ -129,6 +194,7 @@ class ProductBase(BaseModel):
     selling_price: int
     stock_quantity: int
     image_url: Optional[str] = None
+    company_id: Optional[int] = None
 
 # Schema for creating a product
 class ProductCreate(ProductBase):
@@ -153,12 +219,32 @@ class ProductUpdate(BaseModel):
     stock_quantity: Optional[int] = None
     image_url: Optional[str] = None
 
-# Schema for product response
-class ProductResponse(ProductCreate):
+# First, create a simplified vendor schema for product responses
+class VendorInProduct(BaseModel):
     id: int
+    name: str
+    contact_person: Optional[str] = None
+    email: Optional[str] = None  # No validation here
+    phone: Optional[str] = None
+    address: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+# Update the ProductResponse schema to use the simplified vendor schema
+class ProductResponse(BaseModel):
+    id: int
+    product_name: str
+    product_price: int
+    selling_price: int
+    stock_quantity: int
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    vendor_id: Optional[int] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
-    vendor: Optional['VendorBase'] = None  # Add vendor relationship
+    vendor: Optional[VendorInProduct] = None
+    company_id: int
 
     class Config:
         from_attributes = True
@@ -168,20 +254,55 @@ class ProductResponse(ProductCreate):
 class VendorBase(BaseModel):
     name: str
     contact_person: Optional[str] = None
-    email: EmailStr
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    company_id: Optional[int] = None
+
+    @validator('email')
+    def validate_email(cls, v):
+        if v is not None and v != "":
+            if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', v):
+                raise ValueError('Invalid email format')
+        return v
+
+class VendorCreate(BaseModel):
+    name: str
+    contact_person: Optional[str] = None
+    email: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
 
-class VendorCreate(VendorBase):
-    pass
+class VendorUpdate(BaseModel):
+    name: Optional[str] = None
+    contact_person: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
 
-class VendorUpdate(VendorBase):
-    pass
-
-class Vendor(VendorBase):
+class Vendor(BaseModel):
     id: int
+    name: str
+    contact_person: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    company_id: int
     created_at: datetime
-    updated_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+class VendorResponse(BaseModel):
+    id: int
+    name: str
+    contact_person: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    company_id: int
+    created_at: datetime
 
     class Config:
         from_attributes = True
@@ -194,6 +315,7 @@ class SaleCreate(BaseModel):
     pid: int
     quantity: int
     user_id: int
+    company_id: Optional[int] = None
 
 # Schema for Cart Item
 class CartItem(BaseModel):
@@ -227,6 +349,8 @@ class SaleResponse(BaseModel):
     unit_price: float
     total_amount: float
     user_id: int
+    company_id: int
+    status: str
     created_at: datetime
 
     class Config:
@@ -271,7 +395,8 @@ class TransactionResponse(BaseModel):
     total_amount: float
     status: str
     created_at: datetime
-    sales: List[SaleItem]
+    company_id: int
+    sales: List[SaleResponse]
 
     class Config:
         from_attributes = True
@@ -288,14 +413,24 @@ class ContactBase(BaseModel):
     subject: str
     message: str
 
-class ContactCreate(ContactBase):
-    pass
+class ContactCreate(BaseModel):
+    name: str
+    email: str
+    subject: str
+    message: str
 
-class ContactResponse(ContactBase):
+class ContactResponse(BaseModel):
     id: int
+    name: str
+    email: str
+    subject: str
+    message: str
+    status: str
+    response: Optional[str]
+    company_id: int
     created_at: datetime
-    status: str  # e.g., 'pending', 'responded', 'closed'
-    response: Optional[str] = None
+    updated_at: Optional[datetime]
+    responded_by: Optional[int]
 
     class Config:
         from_attributes = True
@@ -320,6 +455,7 @@ class ImportHistoryBase(BaseModel):
     created_at: datetime
     completed_at: Optional[datetime]
     user_id: Optional[int]
+    company_id: Optional[int]
 
     class Config:
         orm_mode = True
@@ -328,11 +464,26 @@ class ImportHistoryCreate(BaseModel):
     filename: str
     user_id: Optional[int]
 
-class ImportHistoryResponse(ImportHistoryBase):
+class ImportHistoryResponse(BaseModel):
     id: int
+    filename: str
+    status: str
+    total_rows: int
+    successful_rows: int
+    failed_rows: int
+    created_at: datetime
+    completed_at: Optional[datetime]
 
+    class Config:
+        from_attributes = True
 
+class ImportHistoryDetailResponse(ImportHistoryResponse):
+    errors: Optional[List[dict]]
+    company_id: int
+    user_id: int
 
+    class Config:
+        from_attributes = True
 
 class UserActivity(BaseModel):
     recent_sales: List[SaleResponse]
@@ -341,69 +492,35 @@ class UserActivity(BaseModel):
 
 
 
+class PaymentType(str, Enum): #.
+    SALE = "sale"
+    SUBSCRIPTION = "subscription"
 
+class PaymentStatus(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
-
-# # Schema for Category:
-# class CategoryBase(BaseModel):
-#     name: str
-#     description: Optional[str] = None
-#     icon: Optional[str] = None
-
-# class CategoryCreate(CategoryBase):
-#     pass
-
-# class Category(CategoryBase):
-#     id: int
-#     product_count: Optional[int] = 0
-#     popular_products: Optional[List[dict]] = []
-
-#     class Config:
-#         # orm_mode = True   # This will cause a warning in Pydantic V2
-#         from_attributes = True  # Updated for Pydantic V2
-
-
-# STKPush Schemas
-# class STKPushBase(BaseModel):
-#     amount: float = Field(..., gt=0)
-#     phone: str = Field(..., pattern="^254\d{9}$")
-
-# class STKPushCreate(STKPushBase):
-#     pass
-
-# class STKPushResponse(STKPushBase):
-#     id: int
-#     merchant_request_id: str
-#     checkout_request_id: str
-#     trans_id: Optional[str] = None
-#     created_at: datetime
-
-#     class Config:
-#         from_attributes = True
-
-
-class PaymentBase(BaseModel):
-    sale_id: int
-    amount: float = Field(..., gt=0)
+class PaymentBase(BaseModel): #.
+    amount: float
     mode: str
-    trans_code: str
+    transaction_code: Optional[str] = None
+    payment_type: PaymentType
+    status: PaymentStatus = PaymentStatus.PENDING
 
-class PaymentCreate(PaymentBase):
-    pass
+class PaymentCreate(PaymentBase): #.
+    sale_id: Optional[int] = None
+    subscription_id: Optional[int] = None
 
-class PaymentResponse(PaymentBase):
+class Payment(PaymentBase): #.
     id: int
     created_at: datetime
-    
+    sale_id: Optional[int]
+    subscription_id: Optional[int]
+
     class Config:
         from_attributes = True
 
-
-# # STK Push Check Response
-# class STKPushCheckResponse(BaseModel):
-#     success: bool
-#     message: str
-#     data: Optional[STKPushResponse] = None
 
 
 class PasswordResetRequest(BaseModel):
@@ -427,28 +544,53 @@ class PasswordReset(BaseModel):
 
 
 class UpdateSale(BaseModel):
-    pid: int
     quantity: int
-    user_id: int
     price: float
-    date: datetime = Field(default_factory=datetime.now)
+    date: datetime
+    user_id: int
+    pid: int
+
+class StockUpdateInfo(BaseModel):
+    product_id: int
+    product_name: str
+    new_stock: int
+
+class SaleUpdateResponse(BaseModel):
+    message: str
+    sale: dict
+    stock_update: StockUpdateInfo
 
     class Config:
         from_attributes = True
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
-
 
 class PaymentConfirmation(BaseModel):
-    payment_mode: str  # e.g., "mpesa", "cash", "card"
+    payment_mode: str
     transaction_code: str
 
+class PaymentResponse(BaseModel):
+    mode: str
+    transaction_code: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class TransactionConfirmResponse(BaseModel):
+    id: int
+    total_amount: float
+    status: str
+    company_id: int
+    payment: PaymentResponse
+    sales_count: int
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 # MPESA Transaction Schemas
 # STK Push Schemas
-class STKPushCreate(BaseModel):
+class STKPushCreate(BaseModel): #.
     phone_number: str
     amount: float
 
@@ -459,7 +601,7 @@ class STKPushCreate(BaseModel):
         except ValueError as e:
             raise ValueError(str(e))
 
-class STKPushResponse(BaseModel):
+class STKPushResponse(BaseModel): #.
     checkout_request_id: str
     merchant_request_id: str
     status: str
@@ -467,15 +609,217 @@ class STKPushResponse(BaseModel):
     response_description: str = "Success. Request accepted for processing"  # Default value
     customer_message: str = "Please check your phone to complete the payment"  # Default value
 
-class STKPushCheckResponse(BaseModel):
+class STKPushCheckResponse(BaseModel): #.
     success: bool
     message: str
     status: Optional[str] = None
 
 
+# MPESACallback schema
 class MPESACallback(BaseModel):
-    merchant_request_id: str
-    checkout_request_id: str
-    result_code: str
-    result_desc: str
+    MerchantRequestID: str
+    CheckoutRequestID: str
+    ResultCode: int
+    ResultDesc: str
+    
+    class Config:
+        from_attributes = True
+
+
+# Start schemas for Company 
+class CompanyBase(BaseModel):
+    name: str
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+    location: Optional[str] = None
+    description: Optional[str] = None
+
+class CompanyCreate(CompanyBase):
+    pass
+
+class CompanyUpdate(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+    location: Optional[str] = None
+
+class CompanyResponse(BaseModel):
+    id: int
+    name: str
+    phone: str
+    email: str
+    location: str
+    user_id: int
+    status: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+# End company schemas
+
+
+# Start schemas for Subscription
+class SubscriptionPlanBase(BaseModel):
+    name: str
+    price: float
+    description: Optional[str] = None
+    features: Optional[str] = None
+
+class SubscriptionPlanCreate(SubscriptionPlanBase):
+    pass
+
+class SubscriptionPlan(SubscriptionPlanBase):
+    id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class SubscriptionBase(BaseModel):
+    company_id: int
+    plan_id: int
+
+class SubscriptionCreate(SubscriptionBase):
+    pass
+
+class Subscription(BaseModel):
+    id: int
+    company_id: int
+    plan_id: int
+    start_date: datetime
+    end_date: datetime
+    status: str
+    created_by: int
+    created_at: datetime
+    plan: SubscriptionPlan  # Include the plan details in the response
+
+    class Config:
+        from_attributes = True
+
+class SubscriptionResponse(Subscription):
+    pass
+
+class SaleItemResponse(BaseModel):
+    id: int
+    product_id: int
+    quantity: int
+    unit_price: float
+    total: float
+    status: str
+
+class TransactionInfo(BaseModel):
+    id: int
+    status: str
+    total_amount: float
+    company_id: int
+    created_at: datetime
+    updated_at: datetime
+
+class SaleConfirmationResponse(BaseModel):
+    message: str
+    transaction: TransactionInfo
+    sales: List[SaleItemResponse]
+    stock_updates: List[StockUpdateInfo]
+
+    class Config:
+        from_attributes = True
+
+class TransactionCancelResponse(BaseModel):
+    message: str
+    transaction: dict
+
+class SaleDetailResponse(BaseModel):
+    id: int
+    pid: int
+    user_id: int
+    first_name: str
+    quantity: int
+    created_at: datetime
+    product_name: str
+    product_price: float
+    total_amount: float
+    company_id: int
+    status: str
+
+    class Config:
+        from_attributes = True
+
+class UserSaleResponse(BaseModel):
+    id: int
+    pid: int
+    user_id: int
+    first_name: str
+    quantity: int
+    created_at: datetime
+    total_amount: float
+    company_id: int
+    status: str
+
+    class Config:
+        from_attributes = True
+
+class StatusUpdate(BaseModel):
+    status: str
+
+class ImportError(BaseModel):
+    row: Optional[int]
+    product_name: Optional[str]
+    error: str
+
+class ImportResponse(BaseModel):
+    import_id: int
+    message: str
+    total_processed: int
+    successful: int
+    failed: int
+    errors: Optional[List[ImportError]]
+    company_id: int
+
+    class Config:
+        from_attributes = True
+
+class ValidationError(BaseModel):
+    row: Optional[int] = None
+    product: Optional[str] = None
+    message: Optional[str] = None
+    errors: Optional[List[str]] = None
+
+class ImportValidationResponse(BaseModel):
+    valid: bool
+    total_rows: int
+    errors: Optional[List[ValidationError]] = None
+
+class ProductBasic(BaseModel):
+    id: int
+    product_name: str
+    product_price: float
+    selling_price: float
+    stock_quantity: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class VendorDetailResponse(BaseModel):
+    id: int
+    name: str
+    contact_person: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    company_id: int
+    created_at: datetime
+    products: List['ProductBasic']
+
+    class Config:
+        from_attributes = True
+
+class MessageResponse(BaseModel):
+    message: str
+    status: bool = True
+    data: Optional[Any] = None
+
+    class Config:
+        from_attributes = True
 

@@ -1,60 +1,86 @@
 import requests
-from base64 import b64encode
+import base64
 from datetime import datetime
-from ..mpesa_config import *
+from ..mpesa_config import (
+    CONSUMER_KEY, 
+    CONSUMER_SECRET, 
+    BUSINESS_SHORT_CODE, 
+    PASS_KEY, 
+    BASE_URL, 
+    CALLBACK_URL
+)
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
+from typing import Dict, Any, Optional
 from app import models
-from app import schemas
+
+def validate_mpesa_config():
+    """Validate MPESA configuration"""
+    missing_vars = []
+    if not CONSUMER_KEY:
+        missing_vars.append("CONSUMER_KEY")
+    if not CONSUMER_SECRET:
+        missing_vars.append("CONSUMER_SECRET")
+    if not BUSINESS_SHORT_CODE:
+        missing_vars.append("BUSINESS_SHORT_CODE")
+    if not PASS_KEY:
+        missing_vars.append("PASS_KEY")
+    if not CALLBACK_URL:
+        missing_vars.append("CALLBACK_URL")
+    
+    if missing_vars:
+        raise ValueError(f"Missing required MPESA configuration: {', '.join(missing_vars)}")
+
+# Call validation on module load
+try:
+    validate_mpesa_config()
+except ValueError as e:
+    print(f"MPESA Configuration Error: {str(e)}")
+
+# Print configuration for debugging (remove in production)
+print("Using MPESA configuration:")
+print(f"CONSUMER_KEY: ...{CONSUMER_KEY[-4:] if CONSUMER_KEY else 'None'}")
+print(f"BUSINESS_SHORT_CODE: {BUSINESS_SHORT_CODE}")
+print(f"CALLBACK_URL: {CALLBACK_URL}")
 
 # Get OAuth access token from Safaricom
-def get_access_token():
-    """Get OAuth access token from Safaricom"""
+async def get_access_token() -> str:
+    """Get access token from Safaricom"""
     try:
-        if not CONSUMER_KEY or not CONSUMER_SECRET:
-            raise ValueError("CONSUMER_KEY or CONSUMER_SECRET not set")
-
-        credentials = b64encode(f"{CONSUMER_KEY}:{CONSUMER_SECRET}".encode()).decode()
+        validate_mpesa_config()
         
+        auth = base64.b64encode(f"{CONSUMER_KEY}:{CONSUMER_SECRET}".encode()).decode('utf-8')
         headers = {
-            "Authorization": f"Basic {credentials}"
+            'Authorization': f'Basic {auth}'
         }
         
-        url = f"{BASE_URL}/oauth/v1/generate?grant_type=client_credentials"
-        
-        
         response = requests.get(
-            url,
+            f'{BASE_URL}/oauth/v1/generate?grant_type=client_credentials',
             headers=headers,
             timeout=30
         )
-
-        if response.status_code != 200:
-            raise Exception(f"Auth failed: {response.status_code} - {response.text}")
+        
+        print("Token Response Status:", response.status_code)
+        print("Token Response Body:", response.text)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if 'access_token' in result:
+                return result['access_token']
+            else:
+                raise ValueError("Access token not found in response")
+        else:
+            raise ValueError(f"Failed to get access token: {response.text}")
             
-        json_response = response.json()
-        access_token = json_response.get("access_token")
-        if not access_token:
-            raise Exception("No access token in response")
-            
-        return access_token
-
     except Exception as e:
-        print(f"Error getting access token: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to get access token: {str(e)}")
+        raise ValueError(f"Failed to get MPESA access token: {str(e)}")
 
 # Generate password for STK Push
-def generate_password(timestamp):
-    """Generate password for STK Push"""
-    try:
-        data_to_encode = f"{BUSINESS_SHORT_CODE}{PASSKEY}{timestamp}"
-        encoded_password = b64encode(data_to_encode.encode()).decode()
-        print(f"Password generation data: {data_to_encode}")
-        print(f"Generated password: {encoded_password}")
-        return encoded_password
-    except Exception as e:
-        print(f"Error generating password: {str(e)}")
-        raise
+def generate_password() -> str:
+    """Generate the password for the STK push"""
+    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    data_to_encode = f"{BUSINESS_SHORT_CODE}{PASS_KEY}{timestamp}"
+    return base64.b64encode(data_to_encode.encode()).decode('utf-8')
 
 # Format phone number to required format (254XXXXXXXXX)
 def format_phone_number(phone: str) -> str:
@@ -100,59 +126,58 @@ def format_phone_number(phone: str) -> str:
     except Exception as e:
         raise ValueError(f"Invalid phone number: {str(e)}")
 
-async def initiate_stk_push_request(phone_number: str, amount: float, access_token: str):
-    """Handle the STK push request to Safaricom"""
+async def initiate_stk_push_request(phone_number: str, amount: float, access_token: str) -> Dict[str, Any]:
+    """Initiate STK push request to Safaricom"""
     try:
-        phone = format_phone_number(phone_number)
+        validate_mpesa_config()
+        
         timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        password = base64.b64encode(f"{BUSINESS_SHORT_CODE}{PASS_KEY}{timestamp}".encode()).decode('utf-8')
+        
+        # Format phone number
+        formatted_phone = phone_number
+        if phone_number.startswith('0'):
+            formatted_phone = '254' + phone_number[1:]
         
         headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
         }
         
-        password = generate_password(timestamp)
-        
         payload = {
-            "BusinessShortCode": str(BUSINESS_SHORT_CODE),
+            "BusinessShortCode": BUSINESS_SHORT_CODE,
             "Password": password,
             "Timestamp": timestamp,
             "TransactionType": "CustomerPayBillOnline",
             "Amount": int(amount),
-            "PartyA": phone,
-            "PartyB": str(BUSINESS_SHORT_CODE),
-            "PhoneNumber": phone,
+            "PartyA": formatted_phone,
+            "PartyB": BUSINESS_SHORT_CODE,
+            "PhoneNumber": formatted_phone,
             "CallBackURL": CALLBACK_URL,
-            "AccountReference": "TestPay",
-            "TransactionDesc": "Test Payment"
+            "AccountReference": "MyDuka",
+            "TransactionDesc": "Payment for goods/services" 
         }
-
-        url = f"{BASE_URL}/mpesa/stkpush/v1/processrequest"
         
+        print("STK Push Request Payload:", payload)
+        print("STK Push Headers:", headers)
         
-
         response = requests.post(
-            url,
+            f'{BASE_URL}/mpesa/stkpush/v1/processrequest',
             json=payload,
             headers=headers,
             timeout=30
         )
         
+        print("STK Push Response Status:", response.status_code)
+        print("STK Push Response Body:", response.text)
         
-        if response.status_code != 200:
-            error_msg = f"{response.status_code}: MPESA API error: {response.text}"
-            print(f"Error: {error_msg}")
-            raise HTTPException(status_code=response.status_code, detail=error_msg)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            raise ValueError(f"MPESA API error: {response.text}")
             
-        return response.json()
-
-    except HTTPException as he:
-        raise he
     except Exception as e:
-        error_msg = f"STK Push error: {str(e)}"
-        print(error_msg)
-        raise HTTPException(status_code=500, detail=error_msg)
-
+        raise ValueError(str(e))
 
 def check_transaction_status(merchant_request_id: str, checkout_request_id: str, db):
     """Check the status of an MPESATransaction"""
@@ -165,50 +190,50 @@ def check_transaction_status(merchant_request_id: str, checkout_request_id: str,
     
     return transaction
 
-
-
-
-async def process_stk_push_callback(callback_data, db: Session):
-    from app.schemas import MPESACallback 
+async def process_stk_push_callback(
+    callback_data: Dict[str, Any],
+    db: Session, 
+    company_id: int
+) -> Dict[str, Any]:
+    """Process STK push callback from Safaricom"""
     try:
-        # Check if the transaction exists
-        transaction = db.query(models.MPESATransaction).filter(
-            models.MPESATransaction.merchant_request_id == callback_data.merchant_request_id,
-            models.MPESATransaction.checkout_request_id == callback_data.checkout_request_id
+        from app.models import MPESATransaction, MPESAStatus
+        
+        # Find the transaction
+        transaction = db.query(MPESATransaction).filter(
+            MPESATransaction.checkout_request_id == callback_data["CheckoutRequestID"],
+            MPESATransaction.company_id == company_id
         ).first()
         
         if not transaction:
-            raise HTTPException(status_code=404, detail="Transaction not found")
-        
-        # Update transaction status
-        if callback_data.result_code != "0":
-            transaction.status = models.MPESAStatus.FAILED
-            transaction.result_code = callback_data.result_code
-            transaction.result_desc = callback_data.result_desc
-            db.commit()
             return {
-                "status": "failure",
-                "message": "Transaction failed",
-                "result_code": callback_data.result_code,
-                "result_desc": callback_data.result_desc
+                "success": False,
+                "message": "Transaction not found"
             }
+            
+        # Update transaction status
+        if callback_data["ResultCode"] == 0:
+            transaction.status = MPESAStatus.COMPLETED
+        else:
+            transaction.status = MPESAStatus.FAILED
+            
+        transaction.result_code = str(callback_data["ResultCode"])
+        transaction.result_desc = callback_data["ResultDesc"]
         
-        # Success case
-        transaction.status = models.MPESAStatus.COMPLETED
-        transaction.result_code = callback_data.result_code
-        transaction.result_desc = callback_data.result_desc
         db.commit()
+        
         return {
-            "status": "success",
-            "message": "Transaction completed"
+            "success": True,
+            "message": "Callback processed successfully"
         }
-    
+        
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
+        print(f"Error processing callback: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Error processing callback: {str(e)}"
+        }
 
 # # This is on function that sends the STK Push request to Safaricom >>   
 # def stk_push_sender(mobile, amount):
