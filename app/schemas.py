@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, validator, Field
+from pydantic import BaseModel, EmailStr, validator, Field, constr
 from datetime import date
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -24,21 +24,18 @@ class UserBase(BaseModel):
             raise ValueError('Invalid phone number format')
         return v
 
-class UserCreate(UserBase):
-    """مخطط إنشاء مستخدم جديد"""
-    password: str = Field(..., min_length=6)
-    confirm_password: str
+class UserCreate(BaseModel):
+    username: str
+    email: EmailStr
+    first_name: str
+    last_name: str
+    phone: str
+    password: str
 
     @validator('phone')
     def validate_phone(cls, v):
         if not re.match(r'^\+?1?\d{9,15}$', v):
             raise ValueError('Invalid phone number format')
-        return v
-
-    @validator('confirm_password')
-    def passwords_match(cls, v, values):
-        if 'password' in values and v != values['password']:
-            raise ValueError('Passwords do not match')
         return v
 
 class UserUpdate(BaseModel):
@@ -84,18 +81,19 @@ class UserUpdate(BaseModel):
         return v
 
 class UserLogin(BaseModel):
-    """مخطط تسجيل الدخول"""
-    email: EmailStr
+    email_or_username: str  # Can be either email or username
     password: str
 
 class UserResponse(BaseModel):
     """مخطط استجابة بيانات المستخدم مع معلومات الشركة"""
     id: int
+    # company_id: Optional[int] = None
     email: str
     first_name: str
     last_name: str
     phone: str
     is_admin: bool
+    hasCompany: bool 
     company_role: Optional[str]
     created_at: datetime
     updated_at: Optional[datetime]
@@ -269,9 +267,15 @@ class VendorBase(BaseModel):
 class VendorCreate(BaseModel):
     name: str
     contact_person: Optional[str] = None
-    email: Optional[str] = None
+    email: Optional[EmailStr] = None
     phone: Optional[str] = None
     address: Optional[str] = None
+
+    @validator('phone')
+    def validate_phone(cls, v):
+        if v and not re.match(r'^\+?1?\d{9,15}$', v):
+            raise ValueError('Invalid phone number format')
+        return v
 
 class VendorUpdate(BaseModel):
     name: Optional[str] = None
@@ -294,6 +298,17 @@ class Vendor(BaseModel):
     class Config:
         from_attributes = True
 
+class ProductInVendor(BaseModel):
+    id: int
+    product_name: str
+    product_price: float
+    selling_price: float
+    stock_quantity: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
 class VendorResponse(BaseModel):
     id: int
     name: str
@@ -302,7 +317,10 @@ class VendorResponse(BaseModel):
     phone: Optional[str] = None
     address: Optional[str] = None
     company_id: int
+    created_by: Optional[int] = None
     created_at: datetime
+    updated_at: datetime
+    products: List[ProductInVendor]
 
     class Config:
         from_attributes = True
@@ -317,57 +335,59 @@ class SaleCreate(BaseModel):
     user_id: int
     company_id: Optional[int] = None
 
-# Schema for Cart Item
+# Basic Cart Item for Sale Creation
 class CartItem(BaseModel):
     product_id: int
     quantity: int
     selling_price: float
 
     @validator('quantity')
-    def validate_quantity(cls, v):
+    def quantity_must_be_positive(cls, v):
         if v <= 0:
-            raise ValueError('Quantity must be greater than 0')
+            raise ValueError('Quantity must be positive')
         return v
 
-# Schema for Cart Sale
+# Cart Sale Creation
 class CartSaleCreate(BaseModel):
-    user_id: int
     cart_items: List[CartItem]
 
-    @validator('cart_items')
-    def validate_cart_items(cls, v):
-        if not v:
-            raise ValueError('Cart items cannot be empty')
-        return v
+# Sale Response in Lists
+class SaleListResponse(BaseModel):
+    id: int
+    product_name: str
+    quantity: int
+    seller_name: str
+    total_amount: float
+    created_at: datetime
 
-# Schema for Sale Response
+    class Config:
+        from_attributes = True
+
+# Individual Sale Response
 class SaleResponse(BaseModel):
     id: int
-    pid: int
     product_name: str
     quantity: int
     unit_price: float
     total_amount: float
-    user_id: int
-    company_id: int
     status: str
     created_at: datetime
 
     class Config:
         from_attributes = True
 
-# Schema for Sale Update
-class SaleUpdate(BaseModel):
-    pid: int
-    user_id: int
-    quantity: int
-    price: float
-    date: date
+# Transaction Response
+class TransactionResponse(BaseModel):
+    id: int
+    total_amount: float
+    status: str
+    created_at: datetime
+    sales: List[SaleResponse]
 
     class Config:
         from_attributes = True
 
-# Schema for Sale Summary (used in user profile)
+# Sale Summary for User Profile
 class SaleSummary(BaseModel):
     product_name: str
     quantity: int
@@ -413,24 +433,17 @@ class ContactBase(BaseModel):
     subject: str
     message: str
 
-class ContactCreate(BaseModel):
-    name: str
-    email: str
-    subject: str
-    message: str
+class ContactCreate(ContactBase):
+    pass
 
-class ContactResponse(BaseModel):
+class ContactResponse(ContactBase):
     id: int
-    name: str
-    email: str
-    subject: str
-    message: str
-    status: str
-    response: Optional[str]
     company_id: int
+    status: str
     created_at: datetime
     updated_at: Optional[datetime]
     responded_by: Optional[int]
+    response: Optional[str]
 
     class Config:
         from_attributes = True
@@ -521,6 +534,13 @@ class Payment(PaymentBase): #.
     class Config:
         from_attributes = True
 
+class PaymentRequest(BaseModel):
+    amount: float
+    phone: str
+
+class PaymentResponse1(BaseModel):
+    amount: float
+    phone: str
 
 
 class PasswordResetRequest(BaseModel):
@@ -590,29 +610,28 @@ class TransactionConfirmResponse(BaseModel):
 
 # MPESA Transaction Schemas
 # STK Push Schemas
-class STKPushCreate(BaseModel): #.
+class STKPushCreate(BaseModel):
     phone_number: str
     amount: float
 
-    @validator('phone_number')
-    def validate_phone(cls, v):
-        try:
-            return format_phone_number(v)
-        except ValueError as e:
-            raise ValueError(str(e))
+    @validator('amount')
+    def validate_amount(cls, v):
+        if v <= 0:
+            raise ValueError('Amount must be greater than 0')
+        return v
 
-class STKPushResponse(BaseModel): #.
+class STKPushResponse(BaseModel):
     checkout_request_id: str
     merchant_request_id: str
     status: str
-    response_code: str = "0"  # Default value
-    response_description: str = "Success. Request accepted for processing"  # Default value
-    customer_message: str = "Please check your phone to complete the payment"  # Default value
-
-class STKPushCheckResponse(BaseModel): #.
-    success: bool
     message: str
-    status: Optional[str] = None
+
+class STKPushCheckResponse(BaseModel):
+    success: bool
+    status: str
+    message: str
+    amount: Optional[float] = None
+    receipt: Optional[str] = None
 
 
 # MPESACallback schema
@@ -621,9 +640,10 @@ class MPESACallback(BaseModel):
     CheckoutRequestID: str
     ResultCode: int
     ResultDesc: str
-    
-    class Config:
-        from_attributes = True
+
+class CallbackResponse(BaseModel):
+    success: bool
+    message: str
 
 
 # Start schemas for Company 
@@ -652,6 +672,16 @@ class CompanyResponse(BaseModel):
     user_id: int
     status: str
     created_at: datetime
+    is_trial: bool = False  # Just add this single field
+
+    class Config:
+        from_attributes = True
+
+class TrialStatusResponse(BaseModel):
+    is_trial: bool
+    message: str
+    minutes_left: int
+    trial_end: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -822,4 +852,69 @@ class MessageResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class SubscriptionStatusResponse(BaseModel):
+    is_active: bool
+    message: str
+    days_remaining: int
+    expiration_date: Optional[datetime]
+    plan_name: Optional[str]
+    subscription_status: str
+
+    class Config:
+        from_attributes = True
+
+class PostRegisterSubscription(BaseModel):
+    company_id: int
+    plan_id: int
+    user_id: int
+
+    class Config:
+        from_attributes = True
+
+class SaleUpdate(BaseModel):
+    product_id: int
+    quantity: int
+    unit_price: float
+
+    @validator('quantity')
+    def quantity_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError('Quantity must be positive')
+        return v
+
+
+
+class CompanyCreateWithPlan(BaseModel):
+    name: str
+    phone: str
+    email: str
+    location: str
+    description: str
+    plan_id: int
+
+
+
+
+
+
+
+
+
+# # Password Reset Schemas
+# class ForgotPasswordRequest(BaseModel):
+#     email: EmailStr
+#     base_url: str
+
+# class ForgotPasswordResponse(BaseModel):
+#     message: str
+
+# class ResetPasswordRequest(BaseModel):
+#     token: str
+#     new_password: constr(min_length=8)  # Ensures password is at least 8 characters
+
+# class ResetPasswordResponse(BaseModel):
+#     message: str
+
+
 

@@ -21,7 +21,7 @@ from typing import List
 import app.models as models
 import app.database as database
 import app.schemas as schemas
-from app.auth import get_password_hash, authenticate_user, verify_refresh_token, create_access_token, create_refresh_token, get_current_user
+from app.auth import get_password_hash, authenticate_user, verify_refresh_token, create_access_token, create_refresh_token, get_current_user, create_password_reset_token, verify_password_reset_token, reset_user_password
 from fastapi.middleware.cors import CORSMiddleware
 # from app.schemas import ProductCreate, VendorCreate, VendorUpdate, Vendor , STKPushCreate, STKPushResponse
 
@@ -35,8 +35,19 @@ from app.utils.mpesa import *
 # from app.mpesa_config import *
 
 from app.dependencies import get_current_company, get_current_user
+from app.core.email import send_contact_email, send_password_reset_email
 
+from datetime import datetime, timedelta
+from jose import jwt
+from sqlalchemy.exc import IntegrityError
+import logging
 
+logger = logging.getLogger(__name__)
+
+# Add these constants at the top of your file
+PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 30
+SECRET_KEY = os.getenv("SECRET_KEY")  # Make sure this is in your .env file
+ALGORITHM = "HS256"
 
 app = FastAPI()
 models.Base.metadata.create_all(database.engine)
@@ -114,39 +125,30 @@ def validate_password(password: str) -> None:
 @app.post("/register", response_model=schemas.UserResponse)
 async def register(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
     try:
-        # Check if email exists
+        # Check existing user
         existing_user = db.query(models.Users).filter(
-            models.Users.email == user.email.lower()
+            or_(
+                models.Users.email == user.email.lower(),
+                models.Users.username == user.username.lower()
+            )
         ).first()
         
         if existing_user:
-            raise HTTPException(status_code=400, detail="Email already registered")
+            if existing_user.email == user.email.lower():
+                raise HTTPException(status_code=400, detail="Email already registered")
+            else:
+                raise HTTPException(status_code=400, detail="Username already taken")
 
-        # Create company first
-        company = models.Company(
-            name=f"{user.first_name}'s Company",
-            email=user.email,
-            phone=user.phone,
-            location="Default Location"
-        )
-        db.add(company)
-        db.flush()
-
-        # Check if this is the first user in the company
-        is_first_user = not db.query(models.Users).filter(
-            models.Users.company_id == company.id
-        ).first()
-
-        # Create user with company relationship
+        # Create user
         db_user = models.Users(
+            username=user.username.lower(),  
             email=user.email.lower(),
             first_name=user.first_name.strip(),
             last_name=user.last_name.strip(),
             phone=user.phone,
             password=get_password_hash(user.password),
-            company_id=company.id,
             company_role='owner',
-            is_admin=is_first_user  # Only first user becomes admin
+            is_admin=True
         )
         
         db.add(db_user)
@@ -161,24 +163,61 @@ async def register(user: schemas.UserCreate, db: Session = Depends(database.get_
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/login", response_model=schemas.TokenResponse)
-async def login(user_credentials: schemas.UserLogin, db: Session = Depends(database.get_db)):
-    user = authenticate_user(db, user_credentials.email, user_credentials.password)
-    if not user:
-        raise HTTPException(
-            status_code=401,
-            detail="Incorrect email or password"
+def login(
+    user_credentials: schemas.UserLogin,
+    db: Session = Depends(database.get_db)
+):
+    try:
+        # Check if input is email or username
+        is_email = '@' in user_credentials.email_or_username
+        print(f"Login attempt with {'email' if is_email else 'username'}: {user_credentials.email_or_username}")
+
+        # Authenticate user
+        user = authenticate_user(
+            db=db,
+            password=user_credentials.password,
+            email=user_credentials.email_or_username if is_email else None,
+            username=user_credentials.email_or_username if not is_email else None
         )
+
+        if not user:
+            print("Authentication failed: Incorrect username/email or password")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username/email or password"
+            )
+
+        # Ensure this block is commented out or removed
+        # if not user.has_active_subscription:
+        #     print("Login failed: User does not have an active subscription")
+        #     raise HTTPException(
+        #         status_code=status.HTTP_403_FORBIDDEN,
+        #         detail="Your company does not have an active subscription. Please renew your subscription to continue."
+        #     )
+
+        # Generate tokens
+        access_token = create_access_token({"user": user.email})
+        refresh_token = create_refresh_token({"user": user.email})
+
+        print(f"User {user.email} authenticated successfully")
+
+        return {
+            "access_token": access_token["token"],
+            "access_token_expires": access_token["expires_at"],
+            "refresh_token": refresh_token["token"],
+            "refresh_token_expires": refresh_token["expires_at"],
+            "token_type": "bearer",
+            "user_email": user.email
+        }
     
-    access_token_data = create_access_token({"user": user.email})
-    refresh_token_data = create_refresh_token({"user": user.email})
-    
-    return {
-        "access_token": access_token_data["token"],
-        "access_token_expires": access_token_data["expires_at"],
-        "refresh_token": refresh_token_data["token"],
-        "refresh_token_expires": refresh_token_data["expires_at"],
-        "token_type": "bearer"
-    }
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Unexpected error during login: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Login failed"
+        )
 
 @app.post("/refresh", response_model=schemas.TokenResponse)
 async def refresh_token(refresh_request: schemas.RefreshTokenRequest):
@@ -248,25 +287,19 @@ def get_all_users(
 
 @app.get("/users/me", response_model=schemas.UserResponse)
 def get_current_user_info(
-    current_user: schemas.UserResponse = Depends(get_current_user),
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    current_user: models.Users = Depends(get_current_user)
 ):
-    # Fetch fresh user data from database to ensure we have all fields
+    # Fetch the user from the database
     user = db.query(models.Users).filter(models.Users.id == current_user.id).first()
     
-    # Convert None to False for is_admin field
-    if user.is_admin is None:
-        user.is_admin = False
-        db.commit()
-        db.refresh(user)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
     
-    # Ensure company_role has a default value if None
-    if user.company_role is None:
-        user.company_role = "user"
-        db.commit()
-        db.refresh(user)
+    # Determine if the user has a company
+    has_company = user.company_id is not None
     
-    # Ensure is_admin is boolean before returning
+    # Return user data including hasCompany status
     return {
         "id": user.id,
         "email": user.email,
@@ -274,9 +307,10 @@ def get_current_user_info(
         "last_name": user.last_name,
         "phone": user.phone,
         "is_admin": bool(user.is_admin),
-        "company_role": user.company_role,  # Added this line
+        "company_role": user.company_role,
         "created_at": user.created_at,
-        "updated_at": user.updated_at
+        "updated_at": user.updated_at,
+        "hasCompany": has_company
     }
 
 @app.get("/users/{user_id}", response_model=schemas.UserResponse)
@@ -299,6 +333,15 @@ def fetch_user_by_email(email: str, db: Session = Depends(database.get_db)):
         )
     return user
 
+@app.get("/users/email/{email}", response_model=schemas.UserResponse)
+def fetch_user_by_email(email: str, db: Session = Depends(database.get_db)):
+    user = db.query(models.Users).filter(models.Users.email == email).first()
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    return user
 
 # Route for updating a user, including password update:
 @app.put("/users/{user_id}", response_model=schemas.UserResponse)
@@ -401,6 +444,83 @@ def revoke_admin_privileges(
     db.refresh(user)
     return user
 
+# Route for seeing the trial left for the user
+@app.get("/users/me/trial", response_model=schemas.TrialStatusResponse)
+async def get_user_trial_status(
+    current_user: schemas.UserResponse = Depends(get_current_user),
+    db: Session = Depends(database.get_db)
+):
+    try:
+        # Get user's company
+        company = db.query(models.Company).filter(
+            models.Company.id == current_user.company_id
+        ).first()
+        
+        if not company:
+            return {
+                "is_trial": False,
+                "message": "No company associated with user",
+                "minutes_left": 0,
+                "trial_end": None,
+                "user_email": current_user.email
+            }
+
+        # Get trial subscription (exactly 24 hours)
+        trial_subscription = db.query(models.Subscription).join(
+            models.SubscriptionPlan
+        ).filter(
+            models.Subscription.company_id == company.id,
+            models.SubscriptionPlan.name == "Free Trial",
+            models.Subscription.status == "active",
+            # Check for exactly 24 hours
+            models.Subscription.end_date <= models.Subscription.start_date + timedelta(hours=24)
+        ).first()
+
+        if not trial_subscription:
+            return {
+                "is_trial": False,
+                "message": "No valid trial found",
+                "minutes_left": 0,
+                "trial_end": None,
+                "user_email": current_user.email
+            }
+
+        # Make sure end_date is timezone-aware
+        end_date = trial_subscription.end_date
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+
+        now = datetime.now(timezone.utc)
+        time_left = end_date - now
+        minutes_left = min(1440, max(0, int(time_left.total_seconds() / 60)))  # Cap at 24 hours (1440 minutes)
+
+        # If trial expired, update statuses
+        if minutes_left == 0:
+            trial_subscription.status = "expired"
+            company.is_trial = False
+            db.commit()
+            message = "Trial has expired"
+        else:
+            hours_left = minutes_left // 60
+            remaining_minutes = minutes_left % 60
+            message = f"Trial active with {hours_left} hours and {remaining_minutes} minutes remaining"
+
+        return {
+            "is_trial": minutes_left > 0,
+            "message": message,
+            "minutes_left": minutes_left,
+            "trial_end": end_date,
+            "user_email": current_user.email
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error checking trial status: {str(e)}"
+        )
+
+
+
 # The end for the User routes <<
 
 
@@ -451,39 +571,37 @@ def get_user_activity(
 
 
 # Start Product Routes >> 
-# Define base directory for the app
-BASE_DIR = Path("/code/app")
+# Define base directory and upload paths
+BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
+PRODUCTS_DIR = UPLOAD_DIR / "products"
 
-# Create uploads directory if it doesn't exist
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Create necessary directories
+os.makedirs(PRODUCTS_DIR, exist_ok=True)
 
-# Mount static files directory - use absolute path
+# Mount the uploads directory
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 # Helper function to handle file upload
-async def save_upload_file(
-    upload_file: UploadFile,
-    company_id: int
-) -> str:
+async def save_upload_file(upload_file: UploadFile, company_id: int) -> str:
     try:
         # Create company-specific directory
-        company_upload_dir = f"uploads/company_{company_id}/products"
-        os.makedirs(company_upload_dir, exist_ok=True)
+        company_dir = PRODUCTS_DIR / f"company_{company_id}"
+        os.makedirs(str(company_dir), exist_ok=True)
         
         # Generate unique filename
         file_extension = Path(upload_file.filename).suffix
         unique_filename = f"{uuid4()}{file_extension}"
         
         # Create full file path
-        file_path = os.path.join(company_upload_dir, unique_filename)
+        file_path = company_dir / unique_filename
         
         # Save file
-        with open(file_path, "wb") as buffer:
+        with open(str(file_path), "wb") as buffer:
             shutil.copyfileobj(upload_file.file, buffer)
         
         # Return relative path for database storage
-        return f"/static/company_{company_id}/products/{unique_filename}"
+        return f"/uploads/products/company_{company_id}/{unique_filename}"
         
     except Exception as e:
         print(f"Error saving file: {str(e)}")
@@ -501,13 +619,44 @@ async def add_product(
     selling_price: int = Form(...),
     stock_quantity: int = Form(...),
     vendor_id: int = Form(...),
-    description: Optional[str] = Form(None),
-    image: Optional[UploadFile] = File(None),
+    description: Optional[str] = Form(default=None),
+    image: UploadFile = File(default=None),  # Changed this line
     db: Session = Depends(database.get_db),
     current_company: models.Company = Depends(get_current_company),
     current_user: schemas.UserResponse = Depends(get_current_user)
 ):
     try:
+        # Create product data dict with company_id
+        product_data = {
+            "product_name": product_name.strip(),
+            "product_price": product_price,
+            "selling_price": selling_price,
+            "stock_quantity": stock_quantity,
+            "vendor_id": vendor_id,
+            "description": description.strip() if description else None,
+            "image_url": DEFAULT_IMAGE_PATH,  # Make sure this constant is defined
+            "company_id": current_company.id
+        }
+
+        # Handle image upload only if a valid image is provided
+        if image and image.filename:
+            try:
+                if not image.content_type.startswith("image/"):
+                    raise HTTPException(
+                        status_code=400, 
+                        detail="File must be an image"
+                    )
+                
+                image_url = await save_upload_file(
+                    image, 
+                    company_id=current_company.id
+                )
+                product_data["image_url"] = image_url
+            except Exception as e:
+                print(f"Error processing image: {str(e)}")
+                # Continue with default image if image processing fails
+                pass
+
         # Check user permissions
         if current_user.company_role not in ['owner', 'admin', 'staff']:
             raise HTTPException(
@@ -526,30 +675,6 @@ async def add_product(
                 detail=f"Vendor with ID {vendor_id} not found in your company"
             )
 
-        # Create product data dict with company_id
-        product_data = {
-            "product_name": product_name.strip(),
-            "product_price": product_price,
-            "selling_price": selling_price,
-            "stock_quantity": stock_quantity,
-            "vendor_id": vendor_id,
-            "description": description.strip() if description else None,
-            "image_url": DEFAULT_IMAGE_PATH,
-            "company_id": current_company.id  
-        }
-
-        # Handle image upload if provided
-        if image and image.filename:
-            if not image.content_type.startswith("image/"):
-                raise HTTPException(status_code=400, detail="File must be an image")
-            
-            # Include company ID in the file path for better organization
-            image_url = await save_upload_file(
-                image, 
-                company_id=current_company.id
-            )
-            product_data["image_url"] = image_url
-
         # Check for duplicate product name within the same company
         existing_product = db.query(models.Products).filter(
             models.Products.product_name == product_name.strip(),
@@ -564,21 +689,6 @@ async def add_product(
         # Create new product in database
         new_product = models.Products(**product_data)
         db.add(new_product)
-        
-        # Add to audit log
-        audit_log = models.AuditLog(
-            action="create_product",
-            entity_type="product",
-            entity_id=new_product.id,
-            user_id=current_user.id,
-            company_id=current_company.id,
-            details={
-                "product_name": product_name,
-                "price": product_price,
-                "selling_price": selling_price
-            }
-        )
-        db.add(audit_log)
         
         db.commit()
         db.refresh(new_product)
@@ -628,20 +738,30 @@ async def check_product_name(
 
 
 @app.get("/products")
-def fetch_products(
+def fetch_my_company_products(
     skip: int = Query(default=0, description="Number of records to skip"),
     limit: int = Query(default=100, description="Maximum number of records to return"),
     search: Optional[str] = Query(None, description="Search products by name"),
     sort_by: Optional[str] = Query(None, description="Sort field"),
     sort_order: Optional[str] = Query("asc", description="Sort direction (asc/desc)"),
     db: Session = Depends(database.get_db),
-    current_company: models.Company = Depends(get_current_company),
     current_user: schemas.UserResponse = Depends(get_current_user)
 ):
     try:
-        # Start with base query for current company
+        # Get user with company relationship
+        user = db.query(models.Users).filter(
+            models.Users.id == current_user.id
+        ).first()
+        
+        if not user or not user.company_id:
+            raise HTTPException(
+                status_code=400,
+                detail="User not associated with any company"
+            )
+
+        # Start with base query for user's company
         query = db.query(models.Products)\
-            .filter(models.Products.company_id == current_company.id)\
+            .filter(models.Products.company_id == user.company_id)\
             .options(joinedload(models.Products.vendor))
 
         # Add search filter if provided
@@ -694,36 +814,18 @@ def fetch_products(
             "total": total_count,
             "skip": skip,
             "limit": limit,
-            "has_more": total_count > (skip + limit)
+            "has_more": total_count > (skip + limit),
+            "company_id": user.company_id
         }
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        print(f"Error fetching products for company {current_company.id}: {str(e)}")
+        print(f"Error fetching products: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"Error fetching products: {str(e)}"
         )
-
-    finally:
-        # Add to audit log
-        try:
-            audit_log = models.AuditLog(
-                action="fetch_products",
-                entity_type="products",
-                user_id=current_user.id,
-                company_id=current_company.id,
-                details={
-                    "search": search,
-                    "sort_by": sort_by,
-                    "sort_order": sort_order,
-                    "results_count": len(formatted_products)
-                }
-            )
-            db.add(audit_log)
-            db.commit()
-        except Exception as e:
-            print(f"Error logging product fetch: {str(e)}")
-            db.rollback()
 
 @app.get("/products/{id}", response_model=schemas.ProductResponse)
 def fetch_product(
@@ -768,8 +870,8 @@ def fetch_product(
                 "address": product.vendor.address
             } if product.vendor else None
         }
-    except HTTPException:
-        raise
+    except HTTPException as he:
+        raise he
     except Exception as e:
         print(f"Error fetching product {id} for company {current_company.id}: {str(e)}")
         raise HTTPException(
@@ -857,30 +959,6 @@ async def update_product(
         
         product.updated_at = datetime.utcnow()
 
-        # Add audit log
-        audit_log = models.AuditLog(
-            action="update_product",
-            entity_type="product",
-            entity_id=product.id,
-            user_id=current_user.id,
-            company_id=current_company.id,
-            details={
-                "previous_values": {
-                    "product_name": product.product_name,
-                    "product_price": product.product_price,
-                    "selling_price": product.selling_price,
-                    "stock_quantity": product.stock_quantity
-                },
-                "new_values": {
-                    "product_name": product_name,
-                    "product_price": product_price,
-                    "selling_price": selling_price,
-                    "stock_quantity": stock_quantity
-                }
-            }
-        )
-        db.add(audit_log)
-
         # Commit changes
         db.commit()
         db.refresh(product)
@@ -955,19 +1033,6 @@ async def remove_product_image(
         product.image_url = DEFAULT_IMAGE_PATH
         product.updated_at = datetime.utcnow()
         
-        # Add audit log
-        audit_log = models.AuditLog(
-            action="remove_product_image",
-            entity_type="product",
-            entity_id=product.id,
-            user_id=current_user.id,
-            company_id=current_company.id,
-            details={
-                "previous_image_url": product.image_url
-            }
-        )
-        db.add(audit_log)
-        
         db.commit()
         db.refresh(product)
         
@@ -986,6 +1051,7 @@ async def remove_product_image(
         db.rollback()
         print(f"Error removing image for product {id} in company {current_company.id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.delete("/products/{id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_product(
@@ -1014,15 +1080,6 @@ async def delete_product(
                 detail="Product not found in your company"
             )
 
-        # Store product info for audit log
-        product_info = {
-            "id": product.id,
-            "product_name": product.product_name,
-            "product_price": product.product_price,
-            "selling_price": product.selling_price,
-            "stock_quantity": product.stock_quantity
-        }
-
         # Delete image file if exists
         if product.image_url and not product.image_url.endswith('default-product.png'):
             image_path = os.path.join(
@@ -1033,19 +1090,6 @@ async def delete_product(
             )
             if os.path.exists(image_path):
                 os.remove(image_path)
-
-        # Add audit log before deletion
-        audit_log = models.AuditLog(
-            action="delete_product",
-            entity_type="product",
-            entity_id=product.id,
-            user_id=current_user.id,
-            company_id=current_company.id,
-            details={
-                "deleted_product": product_info
-            }
-        )
-        db.add(audit_log)
 
         # Delete the product
         db.delete(product)
@@ -1078,14 +1122,13 @@ def create_sale(
     current_user: schemas.UserResponse = Depends(get_current_user)
 ):
     try:
-        print(f"Processing sale for company {current_company.id}")  # Debug log
-        
-        # First validate all products and calculate total
-        sales_to_create = []
+        # Initialize total amount
         total_amount = 0
+        sales_records = []
 
+        # Process each item in the cart
         for item in sale.cart_items:
-            # Query product with company check
+            # Get product for current company
             product = db.query(models.Products).filter(
                 models.Products.id == item.product_id,
                 models.Products.company_id == current_company.id
@@ -1094,99 +1137,69 @@ def create_sale(
             if not product:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"Product with ID {item.product_id} not found in your company"
+                    detail=f"Product {item.product_id} not found in your company"
                 )
 
-            # Check stock
+            # Validate stock
             if product.stock_quantity < item.quantity:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Not enough stock for {product.product_name}. Available: {product.stock_quantity}"
+                    detail=f"Insufficient stock for {product.product_name}"
                 )
 
-            # Store product info for later
-            sales_to_create.append({
-                "product": product,
-                "quantity": item.quantity,
-                "unit_price": item.selling_price
-            })
-            
-            total_amount += (item.quantity * item.selling_price)
+            # Calculate item total and update total amount
+            item_total = item.quantity * item.selling_price
+            total_amount += item_total
 
-        # Create transaction record with company context
+            # Create sale record
+            sale_record = models.Sales(
+                pid=product.id,
+                quantity=item.quantity,
+                unit_price=item.selling_price,
+                user_id=current_user.id,
+                company_id=current_company.id,
+                status="completed"
+            )
+            db.add(sale_record)
+            db.flush()  # Get the sale_record ID
+            sales_records.append((sale_record, product))
+
+            # Update product stock
+            product.stock_quantity -= item.quantity
+
+        # Create transaction record
         transaction = models.Transactions(
             user_id=current_user.id,
             company_id=current_company.id,
             total_amount=total_amount,
-            status="pending"
+            status="completed"
         )
         db.add(transaction)
         db.flush()
 
-        # Create sales records with company context
-        sales_records = []
-        for item in sales_to_create:
-            new_sale = models.Sales(
-                pid=item["product"].id,
-                quantity=item["quantity"],
-                unit_price=item["unit_price"],
-                user_id=current_user.id,
-                company_id=current_company.id,
-                status="pending"
-            )
-            db.add(new_sale)
-            db.flush()
-            sales_records.append(new_sale)
-
-            # Update product stock
-            item["product"].stock_quantity -= item["quantity"]
-
-            # Create transaction_sales relationship
-            trans_sale = models.TransactionSales(
+        # Link sales to transaction
+        for sale_record, _ in sales_records:
+            db.add(models.TransactionSales(
                 transaction_id=transaction.id,
-                sale_id=new_sale.id,
+                sale_id=sale_record.id,
                 company_id=current_company.id
-            )
-            db.add(trans_sale)
-
-        # Add audit log
-        models.AuditLog.log(
-            db=db,
-            action="create_sale",
-            entity_type="transaction",
-            entity_id=transaction.id,
-            user_id=current_user.id,
-            company_id=current_company.id,
-            details={
-                "total_amount": total_amount,
-                "items_count": len(sales_records),
-                "products": [
-                    {
-                        "id": item["product"].id,
-                        "name": item["product"].product_name,
-                        "quantity": item["quantity"],
-                        "unit_price": item["unit_price"]
-                    }
-                    for item in sales_to_create
-                ]
-            }
-        )
+            ))
 
         # Commit all changes
         db.commit()
 
-        # Format response
+        # Return formatted response
         return {
             "id": transaction.id,
             "total_amount": total_amount,
-            "status": transaction.status,
+            "status": "completed",
             "created_at": transaction.created_at,
             "company_id": current_company.id,
             "sales": [
                 {
                     "id": sale.id,
                     "pid": sale.pid,
-                    "product_name": item["product"].product_name,
+                    "product_name": product.product_name,
                     "quantity": sale.quantity,
                     "unit_price": sale.unit_price,
                     "total_amount": sale.quantity * sale.unit_price,
@@ -1195,293 +1208,207 @@ def create_sale(
                     "status": sale.status,
                     "created_at": sale.created_at
                 }
-                for sale, item in zip(sales_records, sales_to_create)
+                for sale, product in sales_records
             ]
         }
 
     except HTTPException as he:
-        print(f"HTTP Exception in company {current_company.id}: {he.detail}")
         db.rollback()
         raise he
     except Exception as e:
-        print(f"Unexpected error in company {current_company.id}: {str(e)}")
         db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"An unexpected error occurred: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/confirm-payment/{transaction_id}")
-def confirm_payment(
-    transaction_id: int,
-    payment_info: schemas.PaymentConfirmation,
-    db: Session = Depends(database.get_db),
-    current_company: models.Company = Depends(get_current_company),
-    current_user: schemas.UserResponse = Depends(get_current_user)
-):
-    try:
-        # Get the transaction with company check
-        transaction = db.query(models.Transactions).filter(
-            models.Transactions.id == transaction_id,
-            models.Transactions.company_id == current_company.id
-        ).first()
 
-        if not transaction:
-            raise HTTPException(
-                status_code=404,
-                detail="Transaction not found in your company"
-            )
+# @app.post("/payments", response_model=schemas.PaymentResponse1)
+# async def process_payment(payment_data: schemas.PaymentRequest, db: Session = Depends(database.get_db)):
+#     try:
+#         # Simulate payment processing logic
+#         print(f"Processing payment for {payment_data.phone} with amount {payment_data.amount}")
 
-        if transaction.status != "pending":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Transaction is already {transaction.status}"
-            )
+#         # Simulate a successful payment transaction
+#         transaction_id = 12345  # This would be generated by your payment gateway
 
-        # Get all associated sales with company check
-        sales = db.query(models.Sales).join(
-            models.TransactionSales
-        ).filter(
-            models.TransactionSales.transaction_id == transaction_id,
-            models.Sales.company_id == current_company.id
-        ).all()
+#         # Create a new payment record in the database
+#         payment = models.Payment(
+#             amount=payment_data.amount,
+#             phone=payment_data.phone,
+#             transaction_id=transaction_id,
+#             status="completed"  # Assume the payment is successful
+#         )
+#         db.add(payment)
+#         db.commit()
+#         db.refresh(payment)
 
-        # Track changes for audit log
-        stock_changes = []
+#         return {
+#             "message": "Payment processed successfully",
+#             "transaction_id": payment.transaction_id
+#         }
+#     except Exception as e:
+#         db.rollback()
+#         raise HTTPException(status_code=500, detail=str(e))
 
-        # Update product quantities and sale status
-        for sale in sales:
-            product = db.query(models.Products).filter(
-                models.Products.id == sale.pid,
-                models.Products.company_id == current_company.id
-            ).first()
+
+# @app.post("/confirm-payment/{transaction_id}")
+# def confirm_payment(
+#     transaction_id: int,
+#     payment_info: schemas.PaymentConfirmation,
+#     db: Session = Depends(database.get_db),
+#     current_company: models.Company = Depends(get_current_company),
+#     current_user: schemas.UserResponse = Depends(get_current_user)
+# ):
+#     try:
+#         # Get transaction for current company
+#         transaction = db.query(models.Transactions).filter(
+#             models.Transactions.id == transaction_id,
+#             models.Transactions.company_id == current_company.id
+#         ).first()
+
+#         if not transaction:
+#             raise HTTPException(status_code=404, detail="Transaction not found")
+#         if transaction.status == "completed":
+#             raise HTTPException(status_code=400, detail="Transaction already completed")
+
+#         # Get associated sales
+#         sales = db.query(models.Sales).join(
+#             models.TransactionSales
+#         ).filter(
+#             models.TransactionSales.transaction_id == transaction_id,
+#             models.Sales.company_id == current_company.id
+#         ).all()
+
+#         # Update product stock and sales status
+#         for sale in sales:
+#             product = db.query(models.Products).filter(
+#                 models.Products.id == sale.pid,
+#                 models.Products.company_id == current_company.id
+#             ).first()
             
-            if not product:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Product not found in your company"
-                )
+#             if not product or product.stock_quantity < sale.quantity:
+#                 raise HTTPException(
+#                     status_code=400,
+#                     detail=f"Insufficient stock for product ID {sale.pid}"
+#                 )
             
-            # Recheck stock availability
-            if product.stock_quantity < sale.quantity:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Not enough stock for product {product.product_name}"
-                )
-            
-            # Track stock change
-            stock_changes.append({
-                "product_id": product.id,
-                "product_name": product.product_name,
-                "previous_stock": product.stock_quantity,
-                "quantity_sold": sale.quantity,
-                "new_stock": product.stock_quantity - sale.quantity
-            })
-            
-            # Update product stock
-            product.stock_quantity -= sale.quantity
-            
-            # Update sale status
-            sale.status = "completed"
+#             # Update stock and sale status
+#             product.stock_quantity -= sale.quantity
+#             sale.status = "completed"
 
-        # Create payment record with company context
-        payment = models.Payment(
-            sale_id=sales[0].id,
-            amount=transaction.total_amount,
-            mode=payment_info.payment_mode,
-            transaction_code=payment_info.transaction_code,
-            company_id=current_company.id,
-            user_id=current_user.id
-        )
-        db.add(payment)
+#         # Create payment record
+#         payment = models.Payment(
+#             sale_id=sales[0].id,
+#             amount=transaction.total_amount,
+#             mode=payment_info.payment_mode,
+#             transaction_code=payment_info.transaction_code,
+#             company_id=current_company.id,
+#             user_id=current_user.id
+#         )
+#         db.add(payment)
 
-        # Update transaction status
-        transaction.status = "completed"
-        transaction.updated_at = datetime.utcnow()
+#         # Complete transaction
+#         transaction.status = "completed"
+#         transaction.updated_at = datetime.utcnow()
 
-        # Add audit log
-        models.AuditLog.log(
-            db=db,
-            action="confirm_payment",
-            entity_type="transaction",
-            entity_id=transaction.id,
-            user_id=current_user.id,
-            company_id=current_company.id,
-            details={
-                "payment_info": {
-                    "amount": transaction.total_amount,
-                    "mode": payment_info.payment_mode,
-                    "transaction_code": payment_info.transaction_code
-                },
-                "stock_changes": stock_changes,
-                "sales_completed": len(sales)
-            }
-        )
+#         db.commit()
 
-        db.commit()
+#         return {
+#             "message": "Payment confirmed successfully",
+#             "transaction": {
+#                 "id": transaction.id,
+#                 "total_amount": transaction.total_amount,
+#                 "status": "completed",
+#                 "payment": {
+#                     "mode": payment.mode,
+#                     "transaction_code": payment.transaction_code
+#                 }
+#             }
+#         }
 
-        return {
-            "message": "Payment confirmed and sales completed successfully",
-            "transaction": {
-                "id": transaction.id,
-                "total_amount": transaction.total_amount,
-                "status": transaction.status,
-                "company_id": current_company.id,
-                "payment": {
-                    "mode": payment.mode,
-                    "transaction_code": payment.transaction_code,
-                    "created_at": payment.created_at
-                },
-                "sales_count": len(sales),
-                "updated_at": transaction.updated_at
-            }
-        }
+#     except HTTPException as he:
+#         db.rollback()
+#         raise he
+#     except Exception as e:
+#         db.rollback()
+#         raise HTTPException(status_code=500, detail=str(e))
 
-    except HTTPException as he:
-        db.rollback()
-        print(f"Error confirming payment in company {current_company.id}: {he.detail}")
-        raise he
-    except Exception as e:
-        db.rollback()
-        print(f"Unexpected error in company {current_company.id}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error confirming payment: {str(e)}"
-        )
+# # This is for confirming a sale:    
+# @app.post("/sales/confirm/{transaction_id}", response_model=schemas.SaleConfirmationResponse)
+# def confirm_sale(
+#     transaction_id: int,
+#     db: Session = Depends(database.get_db),
+#     current_company: models.Company = Depends(get_current_company),
+#     current_user: schemas.UserResponse = Depends(get_current_user)
+# ):
+#     try:
+#         # Get pending transaction
+#         transaction = db.query(models.Transactions).filter(
+#             models.Transactions.id == transaction_id,
+#             models.Transactions.company_id == current_company.id,
+#             models.Transactions.status == "pending"
+#         ).first()
 
-# This is for confirming a sale:    
-@app.post("/sales/confirm/{transaction_id}", response_model=schemas.SaleConfirmationResponse)
-def confirm_sale(
-    transaction_id: int,
-    db: Session = Depends(database.get_db),
-    current_company: models.Company = Depends(get_current_company),
-    current_user: schemas.UserResponse = Depends(get_current_user)
-):
-    try:
-        # Fetch the pending transaction with company check
-        transaction = db.query(models.Transactions).filter(
-            models.Transactions.id == transaction_id,
-            models.Transactions.status == "pending",
-            models.Transactions.company_id == current_company.id
-        ).first()
+#         if not transaction:
+#             raise HTTPException(status_code=404, detail="Pending transaction not found")
 
-        if not transaction:
-            raise HTTPException(
-                status_code=404,
-                detail="Pending transaction not found in your company"
-            )
+#         # Get sales items
+#         sales_items = db.query(models.Sales).join(
+#             models.TransactionSales
+#         ).filter(
+#             models.TransactionSales.transaction_id == transaction_id,
+#             models.Sales.company_id == current_company.id
+#         ).all()
 
-        # Get associated sales from transaction_sales
-        sales_items = db.query(models.Sales).join(
-            models.TransactionSales,
-            models.TransactionSales.sale_id == models.Sales.id
-        ).filter(
-            models.TransactionSales.transaction_id == transaction_id,
-            models.Sales.company_id == current_company.id
-        ).all()
+#         if not sales_items:
+#             raise HTTPException(status_code=404, detail="No sales items found")
 
-        if not sales_items:
-            raise HTTPException(
-                status_code=404,
-                detail="No sales items found for this transaction"
-            )
+#         # Update stock and complete sales
+#         for sale in sales_items:
+#             product = db.query(models.Products).filter(
+#                 models.Products.id == sale.pid,
+#                 models.Products.company_id == current_company.id
+#             ).first()
 
-        # Track changes for audit log
-        stock_updates = []
+#             if not product or product.stock_quantity < sale.quantity:
+#                 raise HTTPException(
+#                     status_code=400,
+#                     detail=f"Insufficient stock for product ID {sale.pid}"
+#                 )
 
-        # Update stock for each sale
-        for sale in sales_items:
-            product = db.query(models.Products).filter(
-                models.Products.id == sale.pid,
-                models.Products.company_id == current_company.id
-            ).first()
+#             # Update stock and mark sale as completed
+#             product.stock_quantity -= sale.quantity
+#             sale.status = "completed"
 
-            if not product:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Product with ID {sale.pid} not found in your company"
-                )
+#         # Complete transaction
+#         transaction.status = "completed"
+#         transaction.updated_at = datetime.utcnow()
 
-            # Recheck stock availability
-            if product.stock_quantity < sale.quantity:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Insufficient stock for product {product.product_name}"
-                )
+#         db.commit()
 
-            # Track stock change
-            stock_updates.append({
-                "product_id": product.id,
-                "product_name": product.product_name,
-                "previous_stock": product.stock_quantity,
-                "quantity_sold": sale.quantity,
-                "new_stock": product.stock_quantity - sale.quantity
-            })
+#         return {
+#             "message": "Sale confirmed successfully",
+#             "transaction": {
+#                 "id": transaction.id,
+#                 "total_amount": transaction.total_amount,
+#                 "status": "completed"
+#             },
+#             "sales": [
+#                 {
+#                     "id": sale.id,
+#                     "product_id": sale.pid,
+#                     "quantity": sale.quantity,
+#                     "unit_price": sale.unit_price,
+#                     "total": sale.quantity * sale.unit_price
+#                 }
+#                 for sale in sales_items
+#             ]
+#         }
 
-            # Update product stock
-            product.stock_quantity -= sale.quantity
-            
-            # Update sale status
-            sale.status = "completed"
-            sale.updated_at = datetime.utcnow()
-
-        # Update transaction status
-        transaction.status = "completed"
-        transaction.updated_at = datetime.utcnow()
-
-        # Add audit log
-        models.AuditLog.log(
-            db=db,
-            action="confirm_sale",
-            entity_type="transaction",
-            entity_id=transaction.id,
-            user_id=current_user.id,
-            company_id=current_company.id,
-            details={
-                "transaction_amount": transaction.total_amount,
-                "sales_count": len(sales_items),
-                "stock_updates": stock_updates
-            }
-        )
-        
-        # Commit all changes
-        db.commit()
-
-        return {
-            "message": "Sale confirmed successfully",
-            "transaction": {
-                "id": transaction.id,
-                "status": transaction.status,
-                "total_amount": transaction.total_amount,
-                "company_id": current_company.id,
-                "created_at": transaction.created_at,
-                "updated_at": transaction.updated_at
-            },
-            "sales": [
-                {
-                    "id": sale.id,
-                    "product_id": sale.pid,
-                    "quantity": sale.quantity,
-                    "unit_price": sale.unit_price,
-                    "total": sale.quantity * sale.unit_price,
-                    "status": sale.status
-                }
-                for sale in sales_items
-            ],
-            "stock_updates": stock_updates
-        }
-
-    except HTTPException as he:
-        db.rollback()
-        print(f"Error confirming sale in company {current_company.id}: {he.detail}")
-        raise he
-    except Exception as e:
-        db.rollback()
-        print(f"Unexpected error in company {current_company.id}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error confirming sale: {str(e)}"
-        )
+#     except HTTPException as he:
+#         db.rollback()
+#         raise he
+#     except Exception as e:
+#         db.rollback()
+#         raise HTTPException(status_code=500, detail=str(e))
 
 # This is for cancelling a sale:    
 @app.post("/sales/cancel/{transaction_id}", response_model=schemas.TransactionCancelResponse)
@@ -1492,32 +1419,30 @@ def cancel_sale(
     current_user: schemas.UserResponse = Depends(get_current_user)
 ):
     try:
-        # Get transaction with company check
+        # Get pending transaction for current company
         transaction = db.query(models.Transactions).filter(
             models.Transactions.id == transaction_id,
-            models.Transactions.status == "pending",
-            models.Transactions.company_id == current_company.id
+            models.Transactions.company_id == current_company.id,
+            models.Transactions.status == "pending"
         ).first()
 
         if not transaction:
-            raise HTTPException(
-                status_code=404,
-                detail="Pending transaction not found in your company"
-            )
+            raise HTTPException(status_code=404, detail="Pending transaction not found")
 
+        # Update transaction status
         transaction.status = "cancelled"
         transaction.updated_at = datetime.utcnow()
 
-        # Add audit log
-        models.AuditLog.log(
-            db=db,
-            action="cancel_sale",
-            entity_type="transaction",
-            entity_id=transaction.id,
-            user_id=current_user.id,
-            company_id=current_company.id,
-            details={"previous_status": "pending"}
-        )
+        # Get and update associated sales
+        sales = db.query(models.Sales).join(
+            models.TransactionSales
+        ).filter(
+            models.TransactionSales.transaction_id == transaction_id,
+            models.Sales.company_id == current_company.id
+        ).all()
+
+        for sale in sales:
+            sale.status = "cancelled"
 
         db.commit()
 
@@ -1526,170 +1451,8 @@ def cancel_sale(
             "transaction": {
                 "id": transaction.id,
                 "status": "cancelled",
-                "company_id": current_company.id,
+                "total_amount": transaction.total_amount,
                 "updated_at": transaction.updated_at
-            }
-        }
-
-    except Exception as e:
-        db.rollback()
-        print(f"Error cancelling sale in company {current_company.id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/sales/user/{user_id}", response_model=List[schemas.SaleSummary])
-def get_user_sales(user_id: int, db: Session = Depends(database.get_db)):
-    sales = db.query(
-        models.Products.product_name,
-        models.Sales.quantity,
-        (models.Sales.quantity * models.Sales.unit_price).label('total_amount'),
-        models.Sales.created_at
-    ).join(
-        models.Products,
-        models.Sales.pid == models.Products.id
-    ).filter(
-        models.Sales.user_id == user_id
-    ).all()
-
-    return sales
-
-@app.get("/sales", status_code=status.HTTP_200_OK)
-def fetch_sales(db: Session = Depends(database.get_db)):
-    sales = db.query(models.Sales).join(models.Users).join(models.Products).all()
-    return [
-        {
-            "id": sale.id,
-            "pid": sale.pid,
-            "user_id": sale.user_id,
-            "first_name": sale.users.first_name,
-            "quantity": sale.quantity,
-            "created_at": sale.created_at,
-            "product_name": sale.products.product_name, 
-            "product_price": sale.products.product_price,
-            "total_amount": sale.quantity * sale.products.product_price
-        }
-        for sale in sales
-    ]
-
-
-# Route for getting sale by the sale id:
-@app.get("/sales/{id}", status_code=status.HTTP_200_OK)
-def fetch_sale(id: int, db: Session = Depends(database.get_db)):
-    sale = (
-        db.query(models.Sales)
-        .join(models.Users)
-        .join(models.Products)
-        .filter(models.Sales.id == id)
-        .first()
-    )
-    
-    if sale:
-        total_amount = sale.quantity * sale.products.product_price  # Calculate total amount
-        return {
-            "id": sale.id,
-            "pid": sale.pid,
-            "user_id": sale.users.id, 
-            "product_name": sale.products.product_name,
-            "quantity": sale.quantity, 
-            "created_at": sale.created_at,
-            "total_amount": total_amount  # Include total amount in the response
-        }
-    
-    raise HTTPException(status_code=404, detail="Sale not found")
-
-# Route for getting sales by user ID:
-@app.get("/sales/user/{user_id}", status_code=status.HTTP_200_OK)
-def fetch_sales_by_user(user_id: int, db: Session = Depends(database.get_db)):
-    sales = db.query(models.Sales).join(models.Users).join(models.Products).filter(models.Sales.user_id == user_id).all()
-    
-    if not sales:
-        raise HTTPException(status_code=404, detail="No sales found for this user")
-    
-    return [{
-        "id": sale.id,
-        "pid": sale.pid,
-        "user_id": sale.user_id,
-        "first_name": sale.users.first_name,
-        "quantity": sale.quantity,
-        "created_at": sale.created_at,  # Include created_at in the response
-        "total_amount": sale.quantity * sale.products.product_price  # Calculate total amount
-    } for sale in sales]
-    
-
-# Route for updating sales:
-@app.put("/sales/{id}", response_model=schemas.SaleUpdateResponse)
-def update_sale(
-    id: int,
-    request: schemas.UpdateSale,
-    db: Session = Depends(database.get_db),
-    current_company: models.Company = Depends(get_current_company),
-    current_user: schemas.UserResponse = Depends(get_current_user)
-):
-    try:
-        # Fetch the existing sale with company check
-        sale = db.query(models.Sales).filter(
-            models.Sales.id == id,
-            models.Sales.company_id == current_company.id
-        ).first()
-        
-        if not sale:
-            raise HTTPException(
-                status_code=404,
-                detail="Sale not found in your company"
-            )
-
-        # Fetch the product with company check
-        product = db.query(models.Products).filter(
-            models.Products.id == request.pid,
-            models.Products.company_id == current_company.id
-        ).first()
-        
-        if not product:
-            raise HTTPException(
-                status_code=404,
-                detail="Product not found in your company"
-            )
-
-        # Calculate and validate stock change
-        quantity_difference = request.quantity - sale.quantity
-        if product.stock_quantity - quantity_difference < 0:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Not enough stock available for {product.product_name}"
-            )
-
-        # Update the sale
-        sale.quantity = request.quantity
-        sale.price = request.price
-        sale.pid = request.pid
-        sale.updated_at = datetime.utcnow()
-
-        # Update the product stock
-        product.stock_quantity -= quantity_difference
-
-        # Add simple audit log
-        models.AuditLog.log(
-            db=db,
-            action="update_sale",
-            entity_type="sale",
-            entity_id=sale.id,
-            user_id=current_user.id,
-            company_id=current_company.id,
-            details={
-                "quantity_change": quantity_difference,
-                "new_price": request.price
-            }
-        )
-
-        db.commit()
-        
-        return {
-            "message": "Sale updated successfully",
-            "sale": {
-                "id": sale.id,
-                "quantity": sale.quantity,
-                "price": sale.price,
-                "product_id": sale.pid,
-                "updated_at": sale.updated_at
             }
         }
 
@@ -1698,11 +1461,208 @@ def update_sale(
         raise he
     except Exception as e:
         db.rollback()
-        print(f"Error updating sale: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to update sale"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/sales/user/{user_id}", response_model=List[schemas.SaleSummary])
+def get_user_sales(
+    user_id: int,
+    db: Session = Depends(database.get_db),
+    current_company: models.Company = Depends(get_current_company)
+):
+    try:
+        sales = db.query(
+            models.Sales.id,
+            models.Products.product_name,
+            models.Sales.quantity,
+            models.Sales.unit_price,
+            models.Sales.created_at
+        ).join(
+            models.Products
+        ).filter(
+            models.Sales.user_id == user_id,
+            models.Sales.company_id == current_company.id
+        ).order_by(
+            models.Sales.created_at.desc()
+        ).all()
+
+        return [
+            {
+                "id": sale.id,
+                "product_name": sale.product_name,
+                "quantity": sale.quantity,
+                "unit_price": sale.unit_price,
+                "total_amount": sale.quantity * sale.unit_price,
+                "created_at": sale.created_at
+            }
+            for sale in sales
+        ]
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/sales", response_model=List[schemas.SaleListResponse])
+def fetch_sales(
+    db: Session = Depends(database.get_db),
+    current_company: models.Company = Depends(get_current_company)
+):
+    try:
+        sales = db.query(
+            models.Sales,
+            models.Users.first_name,
+            models.Products.product_name,
+            models.Products.product_price
+        ).join(
+            models.Users
+        ).join(
+            models.Products
+        ).filter(
+            models.Sales.company_id == current_company.id
+        ).order_by(
+            models.Sales.created_at.desc()
+        ).all()
+
+        return [
+            {
+                "id": sale.Sales.id,
+                "product_name": sale.product_name,
+                "quantity": sale.Sales.quantity,
+                "seller_name": sale.first_name,
+                "total_amount": sale.Sales.quantity * sale.product_price,
+                "created_at": sale.Sales.created_at
+            }
+            for sale in sales
+        ]
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Route for getting sale by the sale id:
+@app.get("/sales/{id}", status_code=status.HTTP_200_OK)
+def fetch_sale(
+    id: int,
+    db: Session = Depends(database.get_db),
+    current_company: models.Company = Depends(get_current_company)
+):
+    try:
+        sale = db.query(
+            models.Sales,
+            models.Products.product_name,
+        ).join(
+            models.Products
+        ).filter(
+            models.Sales.id == id,
+            models.Sales.company_id == current_company.id
+        ).first()
+
+        if not sale:
+            raise HTTPException(status_code=404, detail="Sale not found")
+
+        return {
+            "id": sale.Sales.id,
+            "product_name": sale.product_name,
+            "quantity": sale.Sales.quantity,
+            "unit_price": sale.Sales.unit_price,
+            "total_amount": sale.Sales.quantity * sale.Sales.unit_price,
+            "status": sale.Sales.status,
+            "created_at": sale.Sales.created_at
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Route for getting sales by user ID:
+@app.get("/sales/user/{user_id}", status_code=status.HTTP_200_OK)
+def fetch_sales_by_user(
+    user_id: int,
+    db: Session = Depends(database.get_db),
+    current_company: models.Company = Depends(get_current_company)
+):
+    try:
+        sales = db.query(
+            models.Sales,
+            models.Products.product_name
+        ).join(
+            models.Products
+        ).filter(
+            models.Sales.user_id == user_id,
+            models.Sales.company_id == current_company.id
+        ).order_by(
+            models.Sales.created_at.desc()
+        ).all()
+
+        if not sales:
+            raise HTTPException(status_code=404, detail="No sales found")
+
+        return [
+            {
+                "id": sale.Sales.id,
+                "product_name": sale.product_name,
+                "quantity": sale.Sales.quantity,
+                "unit_price": sale.Sales.unit_price,
+                "total_amount": sale.Sales.quantity * sale.Sales.unit_price,
+                "status": sale.Sales.status,
+                "created_at": sale.Sales.created_at
+            }
+            for sale in sales
+        ]
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Route for updating sales:
+@app.put("/sales/{id}", response_model=schemas.SaleResponse)
+def update_sale(
+    id: int,
+    request: schemas.SaleUpdate,
+    db: Session = Depends(database.get_db),
+    current_company: models.Company = Depends(get_current_company)
+):
+    try:
+        # Get sale and product
+        sale = db.query(models.Sales).filter(
+            models.Sales.id == id,
+            models.Sales.company_id == current_company.id
+        ).first()
+        
+        if not sale:
+            raise HTTPException(status_code=404, detail="Sale not found")
+
+        product = db.query(models.Products).filter(
+            models.Products.id == request.product_id,
+            models.Products.company_id == current_company.id
+        ).first()
+        
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        # Check stock availability
+        stock_change = request.quantity - sale.quantity
+        if product.stock_quantity < stock_change:
+            raise HTTPException(status_code=400, detail="Insufficient stock")
+
+        # Update sale and stock
+        sale.quantity = request.quantity
+        sale.unit_price = request.unit_price
+        sale.pid = request.product_id
+        product.stock_quantity -= stock_change
+
+        db.commit()
+        
+        return {
+            "id": sale.id,
+            "product_name": product.product_name,
+            "quantity": sale.quantity,
+            "unit_price": sale.unit_price,
+            "total_amount": sale.quantity * sale.unit_price,
+            "status": sale.status,
+            "created_at": sale.created_at
+        }
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # Route for deleting a sale:
@@ -1710,62 +1670,36 @@ def update_sale(
 def delete_sale(
     sale_id: int,
     db: Session = Depends(database.get_db),
-    current_company: models.Company = Depends(get_current_company),
-    current_user: schemas.UserResponse = Depends(get_current_user)
+    current_company: models.Company = Depends(get_current_company)
 ):
     try:
-        # Get sale with company check
-        existing_sale = db.query(models.Sales).filter(
+        # Get sale for current company
+        sale = db.query(models.Sales).filter(
             models.Sales.id == sale_id,
             models.Sales.company_id == current_company.id
         ).first()
 
-        if not existing_sale:
-            raise HTTPException(
-                status_code=404,
-                detail="Sale not found in your company"
-            )
+        if not sale:
+            raise HTTPException(status_code=404, detail="Sale not found")
 
-        # Get product with company check
+        # Restore product stock
         product = db.query(models.Products).filter(
-            models.Products.id == existing_sale.pid,
+            models.Products.id == sale.pid,
             models.Products.company_id == current_company.id
         ).first()
 
         if product:
-            # Restore stock quantity
-            product.stock_quantity += existing_sale.quantity
+            product.stock_quantity += sale.quantity
 
-        # Add audit log
-        models.AuditLog.log(
-            db=db,
-            action="delete_sale",
-            entity_type="sale",
-            entity_id=sale_id,
-            user_id=current_user.id,
-            company_id=current_company.id,
-            details={
-                "quantity_restored": existing_sale.quantity,
-                "product_id": existing_sale.pid
-            }
-        )
-
-        # Delete the sale
-        db.delete(existing_sale)
+        # Delete sale
+        db.delete(sale)
         db.commit()
-        
+
         return None
 
-    except HTTPException as he:
-        db.rollback()
-        raise he
     except Exception as e:
         db.rollback()
-        print(f"Error deleting sale: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to delete sale"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 # The end for the Sale routes <<
 
@@ -1778,18 +1712,37 @@ async def create_contact(
     current_company: models.Company = Depends(get_current_company)
 ):
     try:
+        # Create new contact record
         new_contact = models.Contact(
-            **contact.dict(),
+            name=contact.name,
+            email=contact.email,
+            subject=contact.subject,
+            message=contact.message,
             company_id=current_company.id,
             status="open"
         )
+        
         db.add(new_contact)
         db.commit()
         db.refresh(new_contact)
+
+        # Send email notification
+        await send_contact_email(
+            name=contact.name,
+            email=contact.email,
+            subject=contact.subject,
+            message=contact.message
+        )
+
         return new_contact
+
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error creating contact: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error creating contact: {str(e)}"
+        )
 
 @app.post("/contact/{contact_id}/reply", response_model=schemas.ContactResponse)
 async def reply_to_contact(
@@ -2268,50 +2221,56 @@ async def get_import_details(
 
 
 # Start Vendor Routes >>
-
 @app.post("/vendors", response_model=schemas.VendorResponse)
 def create_vendor(
-    vendor: schemas.VendorCreate,
+    vendor: schemas.VendorCreate, 
     db: Session = Depends(database.get_db),
-    current_company: models.Company = Depends(get_current_company),
-    current_user: schemas.UserResponse = Depends(get_current_user)
+    current_user: schemas.UserResponse = Depends(get_current_user) 
 ):
     try:
-        # Check if vendor already exists in company
-        existing_vendor = db.query(models.Vendor).filter(
-            models.Vendor.name == vendor.name,
-            models.Vendor.company_id == current_company.id
+        # Get user's company
+        company = db.query(models.Company).filter(
+            models.Company.id == current_user.company_id
         ).first()
         
-        if existing_vendor:
+        if not company:
             raise HTTPException(
-                status_code=400,
-                detail="Vendor already exists in your company"
+                status_code=404,
+                detail="Company not found"
             )
 
-        # Create new vendor
+        # Create vendor with company_id
         db_vendor = models.Vendor(
-            **vendor.dict(),
-            company_id=current_company.id,
-            created_by=current_user.id
+            name=vendor.name,
+            contact_person=vendor.contact_person,
+            email=vendor.email,
+            phone=vendor.phone,
+            address=vendor.address,
+            company_id=company.id
         )
         
         db.add(db_vendor)
         db.commit()
         db.refresh(db_vendor)
-        
         return db_vendor
-
-    except HTTPException as he:
-        db.rollback()
-        raise he
+        
     except Exception as e:
         db.rollback()
-        print(f"Error creating vendor in company {current_company.id}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Error creating vendor"
-        )
+        print(f"Error creating vendor: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/vendors", response_model=List[schemas.Vendor])
+def get_vendors(
+    skip: int = 0, 
+    limit: int = 100, 
+    db: Session = Depends(database.get_db),
+    current_user: schemas.UserResponse = Depends(get_current_user)
+):
+    vendors = db.query(models.Vendor).filter(
+        models.Vendor.company_id == current_user.company_id
+    ).offset(skip).limit(limit).all()
+    
+    return vendors
 
 @app.get("/vendors", response_model=List[schemas.VendorResponse])
 def get_vendors(
@@ -2351,28 +2310,28 @@ def get_vendors(
             detail="Error fetching vendors"
         )
 
-@app.get("/vendors/{vendor_id}", response_model=schemas.VendorDetailResponse)
+@app.get("/vendors/{vendor_id}", response_model=schemas.VendorResponse)
 def get_vendor(
     vendor_id: int,
     db: Session = Depends(database.get_db),
     current_company: models.Company = Depends(get_current_company)
 ):
     try:
-        # Get vendor with company check and products
-        vendor = db.query(models.Vendor)\
-            .options(joinedload(models.Vendor.products))\
-            .filter(
-                models.Vendor.id == vendor_id,
-                models.Vendor.company_id == current_company.id
-            )\
-            .first()
-        
+        # Get vendor with products
+        vendor = db.query(models.Vendor).filter(
+            models.Vendor.id == vendor_id,
+            models.Vendor.company_id == current_company.id
+        ).first()
+
         if not vendor:
-            raise HTTPException(
-                status_code=404,
-                detail="Vendor not found in your company"
-            )
-            
+            raise HTTPException(status_code=404, detail="Vendor not found")
+
+        # Get vendor's products
+        products = db.query(models.Products).filter(
+            models.Products.vendor_id == vendor_id,
+            models.Products.company_id == current_company.id
+        ).all()
+
         return {
             "id": vendor.id,
             "name": vendor.name,
@@ -2381,28 +2340,24 @@ def get_vendor(
             "phone": vendor.phone,
             "address": vendor.address,
             "company_id": vendor.company_id,
+            "created_by": vendor.created_by,
             "created_at": vendor.created_at,
+            "updated_at": vendor.updated_at,
             "products": [
                 {
                     "id": product.id,
-                    "name": product.product_name,
-                    "price": product.product_price,
+                    "product_name": product.product_name,
+                    "product_price": product.product_price,
                     "selling_price": product.selling_price,
-                    "stock": product.stock_quantity,
+                    "stock_quantity": product.stock_quantity,
                     "created_at": product.created_at
                 }
-                for product in vendor.products
-            ] if vendor.products else []
+                for product in products
+            ]
         }
 
-    except HTTPException as he:
-        raise he
     except Exception as e:
-        print(f"Error fetching vendor in company {current_company.id}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Error fetching vendor details"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/vendors/{vendor_id}", response_model=schemas.VendorResponse)
 def update_vendor(
@@ -2535,18 +2490,33 @@ print("Access Token: ",get_access_token())
 
 # Start Company Routes >>   
 @app.post("/companies", response_model=schemas.CompanyResponse)
-def create_company(
+async def create_company(
     company: schemas.CompanyCreate,
+    plan_id: int,  # Accept plan_id as a query parameter
     current_user: schemas.UserResponse = Depends(get_current_user),
     db: Session = Depends(database.get_db)
 ):
     try:
-        # Create new company with current user as owner
+        # Check if user already has a company
+        if current_user.company_id:
+            raise HTTPException(
+                status_code=400,
+                detail="User already has a company associated"
+            )
+
+        # Validate subscription plan
+        plan = db.query(models.SubscriptionPlan).filter(
+            models.SubscriptionPlan.id == plan_id
+        ).first()
+        if not plan:
+            raise HTTPException(status_code=404, detail="Subscription plan not found")
+
+        # Create new company
         db_company = models.Company(
             name=company.name,
-            phone=company.phone or "",  # Provide default value since it's required
-            email=company.email or "",  # Provide default value since it's required
-            location=company.location or "",  # Provide default value since it's required
+            phone=company.phone or "",
+            email=company.email or "",
+            location=company.location or "",
             description=company.description,
             user_id=current_user.id,
             status="active"
@@ -2561,6 +2531,17 @@ def create_company(
         user.company_id = db_company.id
         user.company_role = "owner"
         db.commit()
+
+        # Create a subscription for the company
+        subscription = models.Subscription(
+            company_id=db_company.id,
+            plan_id=plan.id,
+            start_date=datetime.utcnow(),
+            end_date=datetime.utcnow() + timedelta(days=30),  # Example: 30-day subscription
+            status="active"
+        )
+        db.add(subscription)
+        db.commit()
         
         return db_company
         
@@ -2569,7 +2550,7 @@ def create_company(
         print(f"Error creating company: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail="Error creating company"
+            detail=f"Error creating company: {str(e)}"
         )
 
 @app.get("/companies/me", response_model=schemas.CompanyResponse)
@@ -2578,19 +2559,20 @@ def get_my_company(
     current_user: schemas.UserResponse = Depends(get_current_user)
 ):
     try:
-        company = db.query(models.Company)\
-            .filter(
+        # Try to find company by both user_id and company_id
+        company = db.query(models.Company).filter(
+            or_(
                 models.Company.user_id == current_user.id,
-                models.Company.status == "active"
-            )\
-            .first()
+                models.Company.id == current_user.company_id
+            )
+        ).first()
         
         if not company:
             raise HTTPException(
                 status_code=404,
-                detail="You don't have an active company"
+                detail="No company found for this user"
             )
-        
+
         return company
 
     except HTTPException as he:
@@ -2598,7 +2580,7 @@ def get_my_company(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail="Error fetching company details"
+            detail=f"Error fetching company details: {str(e)}"
         )
 
 @app.put("/companies/me", response_model=schemas.CompanyResponse)
@@ -2850,159 +2832,524 @@ def get_my_subscription(
 async def initiate_stk_push(
     transaction: schemas.STKPushCreate,
     db: Session = Depends(database.get_db),
-    current_user: schemas.UserResponse = Depends(get_current_user)
+    current_company: models.Company = Depends(get_current_company)
 ):
     try:
-        # Get user's company
-        company = db.query(models.Company).filter(
-            models.Company.user_id == current_user.id,
-            models.Company.status == "active"
-        ).first()
-        
-        if not company:
-            raise HTTPException(
-                status_code=404,
-                detail="No active company found for this user"
-            )
+        # Format phone number using existing utility
+        try:
+            formatted_phone = format_phone_number(transaction.phone_number)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
-        # Get fresh access token
+        # Get MPESA access token
         access_token = await get_access_token()
         if not access_token:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to get MPESA access token"
-            )
+            raise HTTPException(status_code=500, detail="Failed to get MPESA token")
 
-        # Send STK Push request
+        # Send STK Push
         result = await initiate_stk_push_request(
-            transaction.phone_number,
-            transaction.amount,
-            access_token
+            phone_number=formatted_phone,
+            amount=transaction.amount,
+            access_token=access_token
         )
-        
-        # Store transaction details
+
+        # Save transaction
         mpesa_tx = models.MPESATransaction(
             checkout_request_id=result["CheckoutRequestID"],
             merchant_request_id=result["MerchantRequestID"],
-            phone_number=transaction.phone_number,
+            phone_number=formatted_phone,
             amount=transaction.amount,
             status="PENDING",
-            company_id=company.id
+            company_id=current_company.id
         )
         db.add(mpesa_tx)
         db.commit()
-        
+
         return {
             "checkout_request_id": result["CheckoutRequestID"],
             "merchant_request_id": result["MerchantRequestID"],
             "status": "pending",
-            "response_code": "0",
-            "response_description": "Success. Request accepted for processing",
-            "customer_message": "Please check your phone to complete the payment"
+            "message": "Please complete payment on your phone"
         }
-            
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        print(f"STK Push error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/stk-push/status", response_model=schemas.STKPushCheckResponse)
 async def check_stk_push_status(
     merchant_request_id: str,
     checkout_request_id: str,
     db: Session = Depends(database.get_db),
-    current_user: schemas.UserResponse = Depends(get_current_user)  # Add current user
+    current_company: models.Company = Depends(get_current_company)
 ):
-    # Get user's company
-    company = db.query(models.Company).filter(
-        models.Company.user_id == current_user.id,
-        models.Company.status == "active"
-    ).first()
-    
-    if not company:
-        raise HTTPException(
-            status_code=404,
-            detail="No active company found for this user"
-        )
-
-    # Check transaction status with company context
-    transaction = db.query(models.MPESATransaction).filter(
-        models.MPESATransaction.merchant_request_id == merchant_request_id,
-        models.MPESATransaction.checkout_request_id == checkout_request_id,
-        models.MPESATransaction.company_id == company.id  # Add company filter
-    ).first()
-    
-    if not transaction:
+    try:
+        # Get transaction
+        transaction = db.query(models.MPESATransaction).filter(
+            models.MPESATransaction.merchant_request_id == merchant_request_id.strip(),
+            models.MPESATransaction.checkout_request_id == checkout_request_id.strip(),
+            models.MPESATransaction.company_id == current_company.id
+        ).first()
+        
+        if not transaction:
+            return {
+                "success": False,
+                "status": "NOT_FOUND",
+                "message": "Transaction not found"
+            }
+        
         return {
-            "success": False,
-            "message": "Transaction not found",
-            "status": None
+            "success": transaction.status == "COMPLETED",
+            "status": transaction.status,
+            "message": f"Payment {transaction.status.lower()}"
         }
-    
-    return {
-        "success": transaction.status == models.MPESAStatus.COMPLETED,
-        "message": f"Transaction {transaction.status}",
-        "status": transaction.status
-    }
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/stk-push/callback")
+@app.post("/stk-push/callback", response_model=schemas.CallbackResponse)
 async def stk_push_callback(
     callback_data: schemas.MPESACallback,
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    current_company: models.Company = Depends(get_current_company)
 ):
-    print("Received callback data:", callback_data)
-    
-    # Get the transaction first to get the company_id
-    transaction = db.query(models.MPESATransaction).filter(
-        models.MPESATransaction.checkout_request_id == callback_data.CheckoutRequestID
-    ).first()
-    
-    if not transaction:
-        raise HTTPException(
-            status_code=404,
-            detail="Transaction not found"
-        )
-    
-    # Convert Pydantic model to dict for the callback processor
-    callback_dict = callback_data.dict()
-    
-    # Pass the company_id to the process_stk_push_callback function
-    return await process_stk_push_callback(callback_dict, db, transaction.company_id)
+    try:
+        # Find transaction
+        transaction = db.query(models.MPESATransaction).filter(
+            models.MPESATransaction.checkout_request_id == callback_data.CheckoutRequestID.strip(),
+            models.MPESATransaction.company_id == current_company.id
+        ).first()
+        
+        if not transaction:
+            raise HTTPException(status_code=404, detail="Transaction not found")
 
-@app.get("/mpesa/config/check")
-async def check_mpesa_config(
+        # Update only essential fields
+        transaction.status = (
+            models.MPESAStatus.COMPLETED if callback_data.ResultCode == 0 
+            else models.MPESAStatus.FAILED
+        )
+        transaction.result_code = str(callback_data.ResultCode)
+        transaction.result_desc = callback_data.ResultDesc
+        
+        db.commit()
+
+        return {
+            "success": True,
+            "message": f"Payment {transaction.status.value}"
+        }
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/subscription/status", response_model=schemas.SubscriptionStatusResponse)
+def check_subscription_status(
+    db: Session = Depends(database.get_db),
     current_user: schemas.UserResponse = Depends(get_current_user)
 ):
     try:
-        # Check if user is admin
-        if not current_user.is_admin:
-            raise HTTPException(
-                status_code=403,
-                detail="Only administrators can check MPESA configuration"
-            )
-            
-        config = {
-            "consumer_key": CONSUMER_KEY[-4:] if CONSUMER_KEY else None,
-            "consumer_secret": CONSUMER_SECRET[-4:] if CONSUMER_SECRET else None,
-            "business_short_code": BUSINESS_SHORT_CODE,
-            "pass_key": PASS_KEY[-4:] if PASS_KEY else None,
-            "callback_url": CALLBACK_URL
-        }
+        # Get user's company
+        company = db.query(models.Company).filter(
+            models.Company.id == current_user.company_id
+        ).first()
         
-        missing = [k for k, v in config.items() if not v]
+        if not company:
+            raise HTTPException(
+                status_code=404,
+                detail="No company found for this user"
+            )
+
+        # Get subscription with plan details
+        subscription = db.query(models.Subscription)\
+            .options(joinedload(models.Subscription.plan))\
+            .filter(
+                models.Subscription.company_id == company.id,
+                models.Subscription.status == "active"
+            ).first()
+
+        if not subscription:
+            return {
+                "is_active": False,
+                "message": "No active subscription found",
+                "days_remaining": 0,
+                "expiration_date": None,
+                "plan_name": None,
+                "subscription_status": "inactive"
+            }
+
+        # Calculate days remaining
+        now = datetime.now(timezone.utc)
+        days_remaining = (subscription.end_date - now).days
+
+        # Determine status message based on days remaining
+        if days_remaining < 0:
+            status_message = "Your subscription has expired"
+            is_active = False
+        elif days_remaining <= 7:
+            status_message = f"Your subscription will expire in {days_remaining} days"
+            is_active = True
+        else:
+            status_message = f"Your subscription is active"
+            is_active = True
+
+        return {
+            "is_active": is_active,
+            "message": status_message,
+            "days_remaining": max(0, days_remaining),
+            "expiration_date": subscription.end_date,
+            "plan_name": subscription.plan.name if subscription.plan else None,
+            "subscription_status": subscription.status
+        }
+
+    except Exception as e:
+        print(f"Error checking subscription status: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Error checking subscription status"
+        )
+
+@app.post("/public/subscribe-after-register", response_model=schemas.SubscriptionResponse)
+async def subscribe_after_register(
+    subscription_data: schemas.PostRegisterSubscription,
+    db: Session = Depends(database.get_db)
+):
+    try:
+        # Ensure plan_id is provided
+        if not hasattr(subscription_data, 'plan_id'):
+            raise HTTPException(status_code=400, detail="Subscription plan ID is required")
+
+        # Fetch the subscription plan
+        plan = db.query(models.SubscriptionPlan).filter(
+            models.SubscriptionPlan.id == subscription_data.plan_id
+        ).first()
+
+        if not plan:
+            raise HTTPException(status_code=404, detail="Subscription plan not found")
+
+        # Use a default duration if duration_days is not available
+        duration_days = 30  # Default to 30 days
+
+        # Create the subscription
+        subscription = models.Subscription(
+            company_id=subscription_data.company_id,
+            plan_id=subscription_data.plan_id,
+            start_date=datetime.now(timezone.utc),
+            end_date=datetime.now(timezone.utc) + timedelta(days=duration_days),
+            status="active",
+            created_by=subscription_data.user_id
+        )
+        
+        db.add(subscription)
+        db.commit()
+        db.refresh(subscription)
+        
+        return subscription
+
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating subscription: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error creating subscription: {str(e)}")
+
+# Add this endpoint to check subscription details
+@app.get("/debug/subscription/{company_id}")
+async def debug_subscription(
+    company_id: int,
+    db: Session = Depends(database.get_db)
+):
+    subscription = db.query(models.Subscription).filter(
+        models.Subscription.company_id == company_id
+    ).first()
+    
+    if not subscription:
+        return {
+            "status": "No subscription found",
+            "company_id": company_id
+        }
+    
+    return {
+        "id": subscription.id,
+        "company_id": subscription.company_id,
+        "plan_id": subscription.plan_id,
+        "status": subscription.status,
+        "start_date": subscription.start_date,
+        "end_date": subscription.end_date,
+        "current_time": datetime.now(timezone.utc)
+    }
+
+@app.post("/forgot-password", response_model=schemas.MessageResponse)
+async def forgot_password(
+    request: schemas.PasswordResetRequest,
+    db: Session = Depends(database.get_db)
+):
+    try:
+        print(f"Received password reset request for email: {request.email}")
+        
+        # Check if user exists
+        user = db.query(models.Users).filter(models.Users.email == request.email).first()
+        if user:
+            print(f"User found with email: {request.email}")
+            token = create_password_reset_token(request.email)
+            base_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+            
+            # Print configuration for debugging
+            print("Email Configuration:")
+            print(f"MAIL_USERNAME: {os.getenv('MAIL_USERNAME')}")
+            print(f"MAIL_FROM: {os.getenv('MAIL_FROM')}")
+            print(f"FRONTEND_URL: {base_url}")
+            
+            try:
+                await send_password_reset_email(request.email, token, base_url)
+                print(f"Password reset email sent successfully to {request.email}")
+                return {
+                    "message": "Password reset email sent successfully",
+                    "status": True,
+                    "data": None
+                }
+            except Exception as email_error:
+                print(f"Error sending email: {str(email_error)}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Error sending email: {str(email_error)}"
+                )
+        else:
+            print(f"No user found with email: {request.email}")
         
         return {
-            "status": "ok" if not missing else "missing_config",
-            "config": {k: "..." + str(v) if v and k != "callback_url" else v for k, v in config.items()},
-            "missing": missing
+            "message": "If an account with that email exists, we have sent a password reset link",
+            "status": True,
+            "data": None
         }
         
     except Exception as e:
+        print(f"Error in forgot_password endpoint: {str(e)}")
         raise HTTPException(
-            status_code=500,
-            detail=f"Error checking MPESA config: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
         )
 
+@app.post("/reset-password", response_model=schemas.MessageResponse)
+async def reset_password(
+    request: schemas.PasswordReset,
+    db: Session = Depends(database.get_db)
+):
+    email = verify_password_reset_token(request.token)
+    if reset_user_password(db, email, request.new_password):
+        return {"message": "Password updated successfully"}
+    
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Failed to reset password"
+    )
+
+@app.post("/payments/initiate", response_model=schemas.PaymentResponse1)
+def initiate_payment(
+    payment_request: schemas.PaymentRequest,
+    db: Session = Depends(database.get_db),
+    current_user: models.Users = Depends(get_current_user)
+):
+    # Validate payment amount
+    if payment_request.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero")
+
+    # Retrieve the user's company
+    if not current_user.company_id:
+        raise HTTPException(status_code=404, detail="User does not have an associated company")
+
+    company_id = current_user.company_id
+
+    # Check if the company exists
+    company = db.query(models.Company).filter(models.Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    # Create a new payment record with status "PENDING"
+    new_payment = models.Payment(
+        amount=payment_request.amount,
+        mode="mpesa",  # Assuming a default mode, adjust as needed
+        payment_type="SALE",  # Assuming a default type, adjust as needed
+        status=models.PaymentStatus.PENDING,
+        created_at=datetime.utcnow(),
+        company_id=company_id
+    )
+    
+    db.add(new_payment)
+    db.commit()
+    db.refresh(new_payment)
+
+    return schemas.PaymentResponse1(
+        amount=new_payment.amount,
+        phone=payment_request.phone
+    )
+
+
+@app.post("/payments/confirm", response_model=schemas.TransactionResponse)
+def confirm_payment_and_create_sale(
+    payment_id: int,
+    sale: schemas.CartSaleCreate,
+    db: Session = Depends(database.get_db),
+    current_user: schemas.UserResponse = Depends(get_current_user)
+):
+    try:
+        # Retrieve the payment record
+        payment = db.query(models.Payment).filter(
+            models.Payment.id == payment_id,
+            models.Payment.status == models.PaymentStatus.COMPLETED
+        ).first()
+
+        if not payment:
+            raise HTTPException(status_code=400, detail="Payment not completed or not found")
+
+        # Initialize total amount
+        total_amount = 0
+        sales_records = []
+
+        # Process each item in the cart
+        for item in sale.cart_items:
+            # Get product for current company
+            product = db.query(models.Products).filter(
+                models.Products.id == item.product_id,
+                models.Products.company_id == current_user.company_id
+            ).first()
+            
+            if not product:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Product {item.product_id} not found in your company"
+                )
+
+            # Validate stock
+            if product.stock_quantity < item.quantity:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Insufficient stock for {product.product_name}"
+                )
+
+            # Calculate item total and update total amount
+            item_total = item.quantity * item.selling_price
+            total_amount += item_total
+
+            # Create sale record
+            sale_record = models.Sales(
+                pid=product.id,
+                quantity=item.quantity,
+                unit_price=item.selling_price,
+                user_id=current_user.id,
+                company_id=current_user.company_id,
+                status="completed"
+            )
+            db.add(sale_record)
+            db.flush()  # Get the sale_record ID
+            sales_records.append((sale_record, product))
+
+            # Update product stock
+            product.stock_quantity -= item.quantity
+
+        # Create transaction record
+        transaction = models.Transactions(
+            user_id=current_user.id,
+            company_id=current_user.company_id,
+            total_amount=total_amount,
+            status="completed"
+        )
+        db.add(transaction)
+        db.flush()
+
+        # Link sales to transaction
+        for sale_record, _ in sales_records:
+            db.add(models.TransactionSales(
+                transaction_id=transaction.id,
+                sale_id=sale_record.id,
+                company_id=current_user.company_id
+            ))
+
+        # Commit all changes
+        db.commit()
+
+        # Return formatted response
+        return {
+            "id": transaction.id,
+            "total_amount": total_amount,
+            "status": "completed",
+            "created_at": transaction.created_at,
+            "company_id": current_user.company_id,
+            "sales": [
+                {
+                    "id": sale.id,
+                    "pid": sale.pid,
+                    "product_name": product.product_name,
+                    "quantity": sale.quantity,
+                    "unit_price": sale.unit_price,
+                    "total_amount": sale.quantity * sale.unit_price,
+                    "user_id": current_user.id,
+                    "company_id": current_user.company_id,
+                    "status": sale.status,
+                    "created_at": sale.created_at
+                }
+                for sale, product in sales_records
+            ]
+        }
+
+    except HTTPException as he:
+        db.rollback()
+        raise he
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+
+
+
+
+
+
+# @app.post("/companies/create-with-plan", response_model=schemas.CompanyResponse)
+# def create_company_with_plan(
+#     company_data: schemas.CompanyCreateWithPlan,
+#     db: Session = Depends(database.get_db),
+#     current_user: schemas.UserResponse = Depends(get_current_user)
+# ):
+#     try:
+#         existing_company = db.query(models.Company).filter(
+#             models.Company.email == company_data.email
+#         ).first()
+#         if existing_company:
+#             raise HTTPException(status_code=400, detail="Company with this email already exists")
+
+#         plan = db.query(models.SubscriptionPlan).filter(
+#             models.SubscriptionPlan.id == company_data.plan_id
+#         ).first()
+#         if not plan:
+#             raise HTTPException(status_code=404, detail="Subscription plan not found")
+
+#         new_company = models.Company(
+#             name=company_data.name,
+#             phone=company_data.phone,
+#             email=company_data.email,
+#             location=company_data.location,
+#             description=company_data.description,
+#             status="active",
+#             user_id=current_user.id
+#         )
+#         db.add(new_company)
+#         db.commit()
+#         db.refresh(new_company)
+
+#         new_subscription = models.Subscription(
+#             company_id=new_company.id,
+#             plan_id=plan.id,
+#             start_date=datetime.utcnow(),
+#             end_date=datetime.utcnow() + timedelta(days=30),
+#             status=models.SubscriptionStatus.ACTIVE.value
+#         )
+#         db.add(new_subscription)
+#         db.commit()
+
+#         return new_company
+
+#     except IntegrityError:
+#         db.rollback()
+#         raise HTTPException(status_code=400, detail="Integrity error: possible duplicate entry")
+#     except Exception as e:
+#         db.rollback()
+#         raise HTTPException(status_code=500, detail=f"Error creating company with plan: {str(e)}")

@@ -7,11 +7,44 @@ from sqlalchemy.orm import Session
 
 
 
+# Company table:
+class Company(Base):
+    __tablename__ = "companies"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    phone = Column(String, nullable=False)
+    email = Column(String, nullable=False)
+    location = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    status = Column(String, default="active")  # active, inactive, suspended
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    user_id = Column(Integer, ForeignKey("users.id"))  # Owner of the company
+    trial_start = Column(DateTime, nullable=True)
+    trial_end = Column(DateTime, nullable=True)
+    is_trial = Column(Boolean, default=False)
+    
+    # Relationships
+    users = relationship("Users", back_populates="company", foreign_keys="[Users.company_id]")
+    products = relationship("Products", back_populates="company")
+    sales = relationship("Sales", back_populates="company")
+    transactions = relationship("Transactions", back_populates="company")
+    payments = relationship("Payment", back_populates="company")
+    imports = relationship("ImportHistory", back_populates="company")
+    vendors = relationship("Vendor", back_populates="company")
+    audit_logs = relationship("AuditLog", back_populates="company")
+    contacts = relationship("Contact", back_populates="company")
+    subscription = relationship("Subscription", back_populates="company")
+    mpesa_transactions = relationship("MPESATransaction", back_populates="company")
+
+
 # User table:
 class Users(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True)
+    username = Column(String, unique=True, nullable=False)
     email = Column(String, unique=True, nullable=False)
     first_name = Column(String, nullable=False)
     last_name = Column(String, nullable=False)
@@ -91,7 +124,7 @@ class Vendor(Base):
     
     company = relationship("Company", back_populates="vendors")
 
-    # Add relationship
+    #
     products = relationship("Products", back_populates="vendor")
 
 
@@ -114,8 +147,8 @@ class Sales(Base):
     users = relationship("Users", back_populates="sales")
     payments = relationship("Payment", back_populates="sale")
     transactions = relationship("Transactions", 
-                              secondary="transaction_sales",
-                              back_populates="sales")
+                                secondary="transaction_sales",
+                                backref="sales")
     company = relationship("Company", back_populates="sales")
 
 
@@ -134,24 +167,18 @@ class Transactions(Base):
     # Relationships
     user = relationship("Users", back_populates="transactions")
     company = relationship("Company", back_populates="transactions")
-    sales = relationship("Sales", 
-                        secondary="transaction_sales",
-                        back_populates="transactions")
 
 
 # Join table for transactions and sales
 class TransactionSales(Base):
     __tablename__ = "transaction_sales"
 
-    # Changed primary key to be a composite key of transaction_id and sale_id
     transaction_id = Column(Integer, ForeignKey("transactions.id"), primary_key=True)
     sale_id = Column(Integer, ForeignKey("sales.id"), primary_key=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Add relationships
-    transaction = relationship("Transactions")
-    sale = relationship("Sales")
     company = relationship("Company")
 
     __table_args__ = (
@@ -257,7 +284,7 @@ class MPESATransaction(Base):
     amount = Column(Float)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
     
-    # Status Tracking - using the Enum class
+    # Status Tracking
     status = Column(
         Enum(MPESAStatus, name='mpesa_status_enum'),
         default=MPESAStatus.PENDING,
@@ -270,39 +297,12 @@ class MPESATransaction(Base):
     
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Relationships
     company = relationship("Company", back_populates="mpesa_transactions")
 
 
-
-# Company table:
-class Company(Base):
-    __tablename__ = "companies"
-
-    id = Column(Integer, primary_key=True)
-    name = Column(String, nullable=False)
-    phone = Column(String, nullable=False)
-    email = Column(String, nullable=False)
-    location = Column(String, nullable=False)
-    description = Column(Text, nullable=True)
-    status = Column(String, default="active")  # active, inactive, suspended
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    user_id = Column(Integer, ForeignKey("users.id"))  # Owner of the company
-    
-    # Relationships
-    users = relationship("Users", back_populates="company", foreign_keys="[Users.company_id]")
-    products = relationship("Products", back_populates="company")
-    sales = relationship("Sales", back_populates="company")
-    transactions = relationship("Transactions", back_populates="company")
-    payments = relationship("Payment", back_populates="company")
-    imports = relationship("ImportHistory", back_populates="company")
-    vendors = relationship("Vendor", back_populates="company")
-    audit_logs = relationship("AuditLog", back_populates="company")
-    contacts = relationship("Contact", back_populates="company")
-    subscription = relationship("Subscription", back_populates="company")
-    mpesa_transactions = relationship("MPESATransaction", back_populates="company")
 
 
 
