@@ -50,7 +50,14 @@ PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 30
 SECRET_KEY = os.getenv("SECRET_KEY")  # Make sure this is in your .env file
 ALGORITHM = "HS256"
 
-app = FastAPI()
+app = FastAPI(
+    title="My API",
+    description="This is a sample API with Swagger UI",
+    version="1.0.0",
+    openapi_url="/api/openapi.json",  # Custom OpenAPI URL
+    docs_url="/api/docs",             # Custom Swagger UI URL
+    redoc_url="/api/redoc"            # Custom ReDoc URL
+)
 models.Base.metadata.create_all(database.engine)
 
 origins = [
