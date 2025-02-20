@@ -17,7 +17,7 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 
 # تكوين أوقات انتهاء الصلاحية
-ACCESS_TOKEN_EXPIRE_MINUTES = 1  # 30 دقيقة
+ACCESS_TOKEN_EXPIRE_HOURS = 1  # 30 دقيقة
 REFRESH_TOKEN_EXPIRE_DAYS = 7  # 7 أيام
 
 
@@ -87,7 +87,7 @@ def check_user(email):
 def create_access_token(data: dict) -> dict:
     """إنشاء access token"""
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
     
     to_encode.update({
         "exp": expire,

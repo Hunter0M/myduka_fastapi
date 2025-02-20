@@ -46,9 +46,8 @@ class Users(Base):
     id = Column(Integer, primary_key=True)
     username = Column(String, unique=True, nullable=False)
     email = Column(String, unique=True, nullable=False)
-    first_name = Column(String, nullable=False)
-    last_name = Column(String, nullable=False)
-    phone = Column(String)
+    full_name = Column(String, nullable=False)
+    # phone = Column(String)
     password = Column(String, nullable=False)
     is_admin = Column(Boolean, default=False)
     company_role = Column(String)
@@ -89,22 +88,33 @@ class Products(Base):
     product_name = Column(String(100), nullable=False)
     product_price = Column(Integer, nullable=False)
     selling_price = Column(Integer, nullable=False)
-    stock_quantity = Column(Integer, nullable=False)
     description = Column(Text, nullable=True) 
     image_url = Column(String(255), nullable=True) 
     vendor_id = Column(Integer, ForeignKey('vendors.id'), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
     vendor = relationship("Vendor", back_populates="products")
     sales = relationship("Sales", back_populates="products")
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
     company = relationship("Company", back_populates="products")
+    stock = relationship("ProductStock", uselist=False, back_populates="product")
 
     @validates('company_id')
     def validate_company(self, key, company_id):
         if not company_id:
             raise ValueError("Company ID is required")
         return company_id
+    
+# Product Stock table:
+class ProductStock(Base):
+    __tablename__ = 'product_stocks'
+    id = Column(Integer, primary_key=True)
+    product_id = Column(Integer, ForeignKey('products.id'), nullable=False)
+    stock_quantity = Column(Integer, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    product = relationship("Products", back_populates="stock")
 
 
 
@@ -470,6 +480,12 @@ class AuditLog(Base):
 #     description = Column(String, nullable=True)
 #     created_at =  Column(DateTime, onupdate=datetime.utcnow, default=datetime.utcnow)
 #     updated_at =  Column(DateTime, onupdate=datetime.utcnow, default=datetime.utcnow)
+
+
+
+
+
+
 
 
 

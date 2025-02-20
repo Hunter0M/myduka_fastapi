@@ -41,6 +41,7 @@ from datetime import datetime, timedelta
 from jose import jwt
 from sqlalchemy.exc import IntegrityError
 import logging
+import pytz
 
 logger = logging.getLogger(__name__)
 
@@ -123,30 +124,37 @@ def validate_password(password: str) -> None:
 # Start route for registering a user >>
 # Route for registering a user:
 @app.post("/register", response_model=schemas.UserResponse)
-async def register(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
+async def register_user(
+    user: schemas.UserCreate,
+    company_id: int = Query(..., description="Company ID to associate with the user"),
+    db: Session = Depends(database.get_db)
+):
     try:
-        # Check existing user
-        existing_user = db.query(models.Users).filter(
-            or_(
-                models.Users.email == user.email.lower(),
-                models.Users.username == user.username.lower()
-            )
-        ).first()
+        validate_password(user.password)
         
-        if existing_user:
-            if existing_user.email == user.email.lower():
-                raise HTTPException(status_code=400, detail="Email already registered")
-            else:
-                raise HTTPException(status_code=400, detail="Username already taken")
+        logger.info("Registering user: %s", user.username)
+        # Check if the company exists
+        company = db.query(models.Company).filter(models.Company.id == company_id).first()
+        if not company:
+            logger.error("Company not found: %d", company_id)
+            raise HTTPException(status_code=404, detail="Company not found")
 
-        # Create user
+        # Check if username already exists
+        existing_user = db.query(models.Users).filter(models.Users.username == user.username).first()
+        if existing_user:
+            logger.error("Username already exists: %s", user.username)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already exists. Please choose a different one."
+            )
+
+        # Create new user associated with the company
         db_user = models.Users(
-            username=user.username.lower(),  
-            email=user.email.lower(),
-            first_name=user.first_name.strip(),
-            last_name=user.last_name.strip(),
-            phone=user.phone,
+            username=user.username,
+            email=user.email,
             password=get_password_hash(user.password),
+            full_name=user.full_name,
+            company_id=company_id,
             company_role='owner',
             is_admin=True
         )
@@ -155,12 +163,68 @@ async def register(user: schemas.UserCreate, db: Session = Depends(database.get_
         db.commit()
         db.refresh(db_user)
         
-        return db_user
-            
+        logger.info("User registered successfully: %s", user.username)
+        
+        # Prepare the response
+        response_data = schemas.UserResponse(
+            id=db_user.id,
+            email=db_user.email,
+            full_name=db_user.full_name,
+            is_admin=db_user.is_admin,
+            hasCompany=True,
+            company_role=db_user.company_role,
+            created_at=db_user.created_at,
+            updated_at=db_user.updated_at,
+            hasUsedFreeTrial=False  
+        )
+        
+        return response_data
+        
+    except HTTPException as he:
+        logger.error("HTTPException: %s", str(he))
+        raise he
+    except IntegrityError as ie:
+        db.rollback()
+        logger.error("IntegrityError: %s", str(ie.orig))
+        if "users_email_key" in str(ie.orig):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This email is already registered."
+            )
+        elif "users_username_key" in str(ie.orig):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This username is already taken."
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="An unexpected error occurred. Please try again."
+            )
     except Exception as e:
         db.rollback()
-        print(f"Registration error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("Unexpected error: %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred. Please try again."
+        )
+
+@app.post("/validate")
+async def validate_user(data: schemas.ValidationRequest, db: Session = Depends(database.get_db)):
+    if data.username:
+        # Check if the username already exists
+        existing_user = db.query(models.Users).filter(models.Users.username == data.username).first()
+        if existing_user:
+            return {"exists": True}
+    
+    if data.email:
+        # Check if the email already exists
+        existing_user = db.query(models.Users).filter(models.Users.email == data.email).first()
+        if existing_user:
+            return {"exists": True}
+    
+    return {"exists": False}    
+
 
 @app.post("/login", response_model=schemas.TokenResponse)
 def login(
@@ -186,14 +250,6 @@ def login(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect username/email or password"
             )
-
-        # Ensure this block is commented out or removed
-        # if not user.has_active_subscription:
-        #     print("Login failed: User does not have an active subscription")
-        #     raise HTTPException(
-        #         status_code=status.HTTP_403_FORBIDDEN,
-        #         detail="Your company does not have an active subscription. Please renew your subscription to continue."
-        #     )
 
         # Generate tokens
         access_token = create_access_token({"user": user.email})
@@ -267,9 +323,8 @@ def get_all_users(
             formatted_users.append({
                 "id": user.id,
                 "email": user.email,
-                "first_name": user.first_name,
-                "last_name": user.last_name,
-                "phone": user.phone,
+                "full_name": user.full_name,
+                # "phone": user.phone,
                 "is_admin": bool(user.is_admin),
                 "company_role": user.company_role or "user",  # Default to "user" if None
                 "created_at": user.created_at,
@@ -299,18 +354,28 @@ def get_current_user_info(
     # Determine if the user has a company
     has_company = user.company_id is not None
     
-    # Return user data including hasCompany status
+    # Check if the user's company has used a free trial
+    has_used_free_trial = False
+    if has_company:
+        free_trial_subscription = db.query(models.Subscription).join(
+            models.SubscriptionPlan
+        ).filter(
+            models.Subscription.company_id == user.company_id,
+            models.SubscriptionPlan.name == "Free Trial"
+        ).first()
+        has_used_free_trial = free_trial_subscription is not None
+    
+    # Return user data including hasCompany and hasUsedFreeTrial status
     return {
         "id": user.id,
         "email": user.email,
-        "first_name": user.first_name,
-        "last_name": user.last_name,
-        "phone": user.phone,
+        "full_name": user.full_name,
         "is_admin": bool(user.is_admin),
         "company_role": user.company_role,
         "created_at": user.created_at,
         "updated_at": user.updated_at,
-        "hasCompany": has_company
+        "hasCompany": has_company,
+        "hasUsedFreeTrial": has_used_free_trial
     }
 
 @app.get("/users/{user_id}", response_model=schemas.UserResponse)
@@ -465,16 +530,15 @@ async def get_user_trial_status(
                 "user_email": current_user.email
             }
 
-        # Get trial subscription (exactly 24 hours)
+        # Get trial subscription
         trial_subscription = db.query(models.Subscription).join(
             models.SubscriptionPlan
         ).filter(
             models.Subscription.company_id == company.id,
             models.SubscriptionPlan.name == "Free Trial",
-            models.Subscription.status == "active",
-            # Check for exactly 24 hours
-            models.Subscription.end_date <= models.Subscription.start_date + timedelta(hours=24)
+            models.Subscription.status == "active"
         ).first()
+
 
         if not trial_subscription:
             return {
@@ -485,29 +549,19 @@ async def get_user_trial_status(
                 "user_email": current_user.email
             }
 
-        # Make sure end_date is timezone-aware
+        # Ensure end_date is timezone-aware
         end_date = trial_subscription.end_date
         if end_date.tzinfo is None:
-            end_date = end_date.replace(tzinfo=timezone.utc)
+            end_date = end_date.replace(tzinfo=pytz.UTC)
 
-        now = datetime.now(timezone.utc)
+        # Get current time as timezone-aware
+        now = datetime.now(pytz.UTC)
         time_left = end_date - now
-        minutes_left = min(1440, max(0, int(time_left.total_seconds() / 60)))  # Cap at 24 hours (1440 minutes)
-
-        # If trial expired, update statuses
-        if minutes_left == 0:
-            trial_subscription.status = "expired"
-            company.is_trial = False
-            db.commit()
-            message = "Trial has expired"
-        else:
-            hours_left = minutes_left // 60
-            remaining_minutes = minutes_left % 60
-            message = f"Trial active with {hours_left} hours and {remaining_minutes} minutes remaining"
+        minutes_left = max(0, int(time_left.total_seconds() / 60))
 
         return {
             "is_trial": minutes_left > 0,
-            "message": message,
+            "message": f"Trial active with {minutes_left} minutes remaining",
             "minutes_left": minutes_left,
             "trial_end": end_date,
             "user_email": current_user.email
@@ -617,24 +671,46 @@ async def add_product(
     product_name: str = Form(...),
     product_price: int = Form(...),
     selling_price: int = Form(...),
-    stock_quantity: int = Form(...),
     vendor_id: int = Form(...),
     description: Optional[str] = Form(default=None),
-    image: UploadFile = File(default=None),  # Changed this line
+    image: UploadFile = File(default=None),
     db: Session = Depends(database.get_db),
     current_company: models.Company = Depends(get_current_company),
     current_user: schemas.UserResponse = Depends(get_current_user)
 ):
     try:
-        # Create product data dict with company_id
+        # Check if the company is on a free trial
+        subscription = db.query(models.Subscription).filter(
+            models.Subscription.company_id == current_company.id,
+            models.Subscription.status == "active"
+        ).first()
+        
+        # this is to check if the company is on a free trial
+        if subscription and subscription.plan.name == "Free Trial":
+            # Count the number of products already created
+            product_count = db.query(models.Products).filter(
+                models.Products.company_id == current_company.id
+            ).count()
+
+            # Debug: Log product count and subscription details
+            print(f"Product count for company {current_company.id}: {product_count}")
+            print(f"Subscription plan: {subscription.plan.name}")
+
+            # this is to check if the company has reached the limit of 5 products   
+            if product_count >= 5:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Free trial allows only up to 5 products"
+                )
+
+        # Create product data dict without stock_quantity
         product_data = {
             "product_name": product_name.strip(),
             "product_price": product_price,
             "selling_price": selling_price,
-            "stock_quantity": stock_quantity,
             "vendor_id": vendor_id,
             "description": description.strip() if description else None,
-            "image_url": DEFAULT_IMAGE_PATH,  # Make sure this constant is defined
+            "image_url": DEFAULT_IMAGE_PATH,
             "company_id": current_company.id
         }
 
@@ -689,7 +765,6 @@ async def add_product(
         # Create new product in database
         new_product = models.Products(**product_data)
         db.add(new_product)
-        
         db.commit()
         db.refresh(new_product)
         
@@ -736,8 +811,7 @@ async def check_product_name(
             detail=f"Error checking product name: {str(e)}"
         )
 
-
-@app.get("/products")
+@app.get("/product")
 def fetch_my_company_products(
     skip: int = Query(default=0, description="Number of records to skip"),
     limit: int = Query(default=100, description="Maximum number of records to return"),
@@ -759,8 +833,9 @@ def fetch_my_company_products(
                 detail="User not associated with any company"
             )
 
-        # Start with base query for user's company
-        query = db.query(models.Products)\
+        # Start with base query for user's company using left join
+        query = db.query(models.Products, models.ProductStock.stock_quantity)\
+            .outerjoin(models.ProductStock, models.ProductStock.product_id == models.Products.id)\
             .filter(models.Products.company_id == user.company_id)\
             .options(joinedload(models.Products.vendor))
 
@@ -785,19 +860,19 @@ def fetch_my_company_products(
         
         # Format the response
         formatted_products = []
-        for product in products:
+        for product, stock_quantity in products:
             product_dict = {
                 "id": product.id,
                 "product_name": product.product_name,
                 "product_price": product.product_price,
                 "selling_price": product.selling_price,
-                "stock_quantity": product.stock_quantity,
                 "description": product.description,
                 "image_url": product.image_url,
                 "created_at": product.created_at,
                 "updated_at": product.updated_at,
                 "vendor_id": product.vendor_id,
                 "company_id": product.company_id,
+                "stock_quantity": stock_quantity or 0,  # Handle None stock quantity
                 "vendor": {
                     "id": product.vendor.id,
                     "name": product.vendor.name,
@@ -855,7 +930,6 @@ def fetch_product(
             "description": product.description,
             "product_price": product.product_price,
             "selling_price": product.selling_price,
-            "stock_quantity": product.stock_quantity,
             "image_url": product.image_url,
             "created_at": product.created_at,
             "updated_at": product.updated_at,
@@ -885,7 +959,7 @@ async def update_product(
     product_name: str = Form(...),
     product_price: float = Form(...),
     selling_price: float = Form(...),
-    stock_quantity: int = Form(...),
+    # stock_quantity: int = Form(...),
     description: Optional[str] = Form(default=None),
     image: Optional[UploadFile] = File(None),
     db: Session = Depends(database.get_db),
@@ -953,9 +1027,10 @@ async def update_product(
         product.product_name = product_name.strip()
         product.product_price = float(product_price)
         product.selling_price = float(selling_price)
-        product.stock_quantity = int(stock_quantity)
-        if description is not None:
-            product.description = description.strip()
+        # product.stock.stock_quantity = stock_quantity
+        # product.stock.updated_at = datetime.utcnow()
+        # if description is not None:
+        #     product.description = description.strip()
         
         product.updated_at = datetime.utcnow()
 
@@ -970,7 +1045,7 @@ async def update_product(
                 "product_name": product.product_name,
                 "product_price": product.product_price,
                 "selling_price": product.selling_price,
-                "stock_quantity": product.stock_quantity,
+                # "stock_quantity": product.stock.stock_quantity,
                 "description": product.description,
                 "image_url": product.image_url,
                 "updated_at": product.updated_at,
@@ -1109,6 +1184,221 @@ async def delete_product(
 
 # The end for the Product routes <<
 
+# Start Stock Routes >>
+# This is for creating a new stock entry for a product:
+@app.post("/product-stocks", response_model=schemas.ProductStockResponse)
+async def post_product_stock(
+    product_id: int = Form(...),
+    stock_quantity: int = Form(...),
+    db: Session = Depends(database.get_db),
+    current_company: models.Company = Depends(get_current_company),
+    current_user: schemas.UserResponse = Depends(get_current_user)
+):
+    try:
+        # Check user permissions
+        if current_user.company_role not in ['owner', 'admin']:
+            raise HTTPException(
+                status_code=403,
+                detail="You don't have permission to modify stock quantities"
+            )
+
+        # Fetch the product with company check
+        product = db.query(models.Products).filter(
+            models.Products.id == product_id,
+            models.Products.company_id == current_company.id
+        ).first()
+        
+        if not product:
+            raise HTTPException(
+                status_code=404,
+                detail="Product not found in your company"
+            )
+
+        # Check if stock entry already exists
+        stock = db.query(models.ProductStock).filter(
+            models.ProductStock.product_id == product_id
+        ).first()
+
+        if stock:
+            # Update existing stock quantity
+            stock.stock_quantity = stock_quantity
+            stock.updated_at = datetime.utcnow()
+        else:
+            # Create new stock entry
+            stock = models.ProductStock(
+                product_id=product_id,
+                stock_quantity=stock_quantity
+            )
+            db.add(stock)
+
+        db.commit()
+        db.refresh(stock)
+        
+        # Return the stock with product name and selling price
+        return {
+            "id": stock.id,
+            "product_id": stock.product_id,
+            "stock_quantity": stock.stock_quantity,
+            "product_name": product.product_name,  # Include product name
+            "selling_price": product.selling_price,  # Include selling price
+            "updated_at": stock.updated_at
+        }
+
+    except HTTPException as he:
+        db.rollback()
+        raise he
+    except Exception as e:
+        db.rollback()
+        print(f"Error posting product stock for product {product_id} in company {current_company.id}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error posting product stock: {str(e)}"
+        )
+
+# This is for retrieving all the product stocks for the current company:
+@app.get("/product-stocks", response_model=List[schemas.ProductStockResponse])
+async def get_product_stocks(
+    db: Session = Depends(database.get_db),
+    current_company: models.Company = Depends(get_current_company)
+):
+    try:
+        # Fetch product stocks with product names and selling prices
+        stocks = db.query(
+            models.ProductStock,
+            models.Products.product_name,
+            models.Products.selling_price  # Include selling price
+        ).join(models.Products).filter(
+            models.Products.company_id == current_company.id
+        ).all()
+
+        # Format the response to include product_name and selling_price
+        response = [
+            {
+                "id": stock.ProductStock.id,
+                "product_id": stock.ProductStock.product_id,
+                "stock_quantity": stock.ProductStock.stock_quantity,
+                "product_name": stock.product_name,
+                "selling_price": stock.selling_price,  # Include selling price
+                "updated_at": stock.ProductStock.updated_at
+            }
+            for stock in stocks
+        ]
+
+        return response
+
+    except Exception as e:
+        print(f"Error fetching product stocks: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Error fetching product stocks"
+        )
+    
+# This is for retrieving the stock quantity of a product:
+@app.get("/product-stocks/{product_id}", response_model=schemas.ProductStockResponse)
+async def get_product_stock(
+    product_id: int,
+    db: Session = Depends(database.get_db),
+    current_company: models.Company = Depends(get_current_company)
+):
+    try:
+        # Fetch the product stock with product name
+        stock = db.query(models.ProductStock, models.Products.product_name)\
+            .join(models.Products)\
+            .filter(
+                models.ProductStock.product_id == product_id,
+                models.Products.company_id == current_company.id
+            ).first()
+        
+        if not stock:
+            raise HTTPException(
+                status_code=404,
+                detail="Stock entry not found for this product"
+            )
+        
+        # Return the stock with product name
+        return {
+            "id": stock.ProductStock.id,
+            "product_id": stock.ProductStock.product_id,
+            "stock_quantity": stock.ProductStock.stock_quantity,
+            "product_name": stock.product_name,  # Include product name
+            "updated_at": stock.ProductStock.updated_at
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Error fetching product stock for product {product_id} in company {current_company.id}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching product stock: {str(e)}"
+        )
+
+@app.put("/product-stocks/{product_id}", response_model=schemas.ProductStockResponse)
+async def update_product_stock(
+    product_id: int,
+    stock_quantity: int = Form(...),
+    db: Session = Depends(database.get_db),
+    current_company: models.Company = Depends(get_current_company),
+    current_user: schemas.UserResponse = Depends(get_current_user)
+):
+    try:
+        print(f"Attempting to update product stock for product_id: {product_id} in company: {current_company.id}")
+
+        # Check user permissions
+        if current_user.company_role not in ['owner', 'admin']:
+            raise HTTPException(
+                status_code=403,
+                detail="You don't have permission to update stock quantities"
+            )
+
+        # Fetch the product stock with product name and selling price
+        stock = db.query(models.ProductStock, models.Products.product_name, models.Products.selling_price)\
+            .join(models.Products)\
+            .filter(
+                models.ProductStock.product_id == product_id,
+                models.Products.company_id == current_company.id
+            ).first()
+        
+        if not stock:
+            print(f"Product stock not found for product_id: {product_id} in company: {current_company.id}")
+            raise HTTPException(
+                status_code=404,
+                detail="Product stock not found in your company"
+            )
+
+        # Update stock quantity
+        stock.ProductStock.stock_quantity = stock_quantity
+        stock.ProductStock.updated_at = datetime.utcnow()
+
+        db.commit()
+        db.refresh(stock.ProductStock)
+        
+        # Return the stock with product name and selling price
+        return {
+            "id": stock.ProductStock.id,
+            "product_id": stock.ProductStock.product_id,
+            "stock_quantity": stock.ProductStock.stock_quantity,
+            "product_name": stock.product_name,  # Include product name
+            "selling_price": stock.selling_price,  # Include selling price
+            "updated_at": stock.ProductStock.updated_at
+        }
+
+    except HTTPException as he:
+        db.rollback()
+        raise he
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating product stock for product {product_id} in company {current_company.id}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error updating product stock: {str(e)}"
+        )
+
+
+# The end for the Stock Routes <<
+
+
+
 
 
 # Start Sale Routes >> 
@@ -1141,7 +1431,7 @@ def create_sale(
                 )
 
             # Validate stock
-            if product.stock_quantity < item.quantity:
+            if product.stock.stock_quantity < item.quantity:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Insufficient stock for {product.product_name}"
@@ -1165,7 +1455,7 @@ def create_sale(
             sales_records.append((sale_record, product))
 
             # Update product stock
-            product.stock_quantity -= item.quantity
+            product.stock.stock_quantity -= item.quantity
 
         # Create transaction record
         transaction = models.Transactions(
@@ -1218,197 +1508,6 @@ def create_sale(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# @app.post("/payments", response_model=schemas.PaymentResponse1)
-# async def process_payment(payment_data: schemas.PaymentRequest, db: Session = Depends(database.get_db)):
-#     try:
-#         # Simulate payment processing logic
-#         print(f"Processing payment for {payment_data.phone} with amount {payment_data.amount}")
-
-#         # Simulate a successful payment transaction
-#         transaction_id = 12345  # This would be generated by your payment gateway
-
-#         # Create a new payment record in the database
-#         payment = models.Payment(
-#             amount=payment_data.amount,
-#             phone=payment_data.phone,
-#             transaction_id=transaction_id,
-#             status="completed"  # Assume the payment is successful
-#         )
-#         db.add(payment)
-#         db.commit()
-#         db.refresh(payment)
-
-#         return {
-#             "message": "Payment processed successfully",
-#             "transaction_id": payment.transaction_id
-#         }
-#     except Exception as e:
-#         db.rollback()
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
-# @app.post("/confirm-payment/{transaction_id}")
-# def confirm_payment(
-#     transaction_id: int,
-#     payment_info: schemas.PaymentConfirmation,
-#     db: Session = Depends(database.get_db),
-#     current_company: models.Company = Depends(get_current_company),
-#     current_user: schemas.UserResponse = Depends(get_current_user)
-# ):
-#     try:
-#         # Get transaction for current company
-#         transaction = db.query(models.Transactions).filter(
-#             models.Transactions.id == transaction_id,
-#             models.Transactions.company_id == current_company.id
-#         ).first()
-
-#         if not transaction:
-#             raise HTTPException(status_code=404, detail="Transaction not found")
-#         if transaction.status == "completed":
-#             raise HTTPException(status_code=400, detail="Transaction already completed")
-
-#         # Get associated sales
-#         sales = db.query(models.Sales).join(
-#             models.TransactionSales
-#         ).filter(
-#             models.TransactionSales.transaction_id == transaction_id,
-#             models.Sales.company_id == current_company.id
-#         ).all()
-
-#         # Update product stock and sales status
-#         for sale in sales:
-#             product = db.query(models.Products).filter(
-#                 models.Products.id == sale.pid,
-#                 models.Products.company_id == current_company.id
-#             ).first()
-            
-#             if not product or product.stock_quantity < sale.quantity:
-#                 raise HTTPException(
-#                     status_code=400,
-#                     detail=f"Insufficient stock for product ID {sale.pid}"
-#                 )
-            
-#             # Update stock and sale status
-#             product.stock_quantity -= sale.quantity
-#             sale.status = "completed"
-
-#         # Create payment record
-#         payment = models.Payment(
-#             sale_id=sales[0].id,
-#             amount=transaction.total_amount,
-#             mode=payment_info.payment_mode,
-#             transaction_code=payment_info.transaction_code,
-#             company_id=current_company.id,
-#             user_id=current_user.id
-#         )
-#         db.add(payment)
-
-#         # Complete transaction
-#         transaction.status = "completed"
-#         transaction.updated_at = datetime.utcnow()
-
-#         db.commit()
-
-#         return {
-#             "message": "Payment confirmed successfully",
-#             "transaction": {
-#                 "id": transaction.id,
-#                 "total_amount": transaction.total_amount,
-#                 "status": "completed",
-#                 "payment": {
-#                     "mode": payment.mode,
-#                     "transaction_code": payment.transaction_code
-#                 }
-#             }
-#         }
-
-#     except HTTPException as he:
-#         db.rollback()
-#         raise he
-#     except Exception as e:
-#         db.rollback()
-#         raise HTTPException(status_code=500, detail=str(e))
-
-# # This is for confirming a sale:    
-# @app.post("/sales/confirm/{transaction_id}", response_model=schemas.SaleConfirmationResponse)
-# def confirm_sale(
-#     transaction_id: int,
-#     db: Session = Depends(database.get_db),
-#     current_company: models.Company = Depends(get_current_company),
-#     current_user: schemas.UserResponse = Depends(get_current_user)
-# ):
-#     try:
-#         # Get pending transaction
-#         transaction = db.query(models.Transactions).filter(
-#             models.Transactions.id == transaction_id,
-#             models.Transactions.company_id == current_company.id,
-#             models.Transactions.status == "pending"
-#         ).first()
-
-#         if not transaction:
-#             raise HTTPException(status_code=404, detail="Pending transaction not found")
-
-#         # Get sales items
-#         sales_items = db.query(models.Sales).join(
-#             models.TransactionSales
-#         ).filter(
-#             models.TransactionSales.transaction_id == transaction_id,
-#             models.Sales.company_id == current_company.id
-#         ).all()
-
-#         if not sales_items:
-#             raise HTTPException(status_code=404, detail="No sales items found")
-
-#         # Update stock and complete sales
-#         for sale in sales_items:
-#             product = db.query(models.Products).filter(
-#                 models.Products.id == sale.pid,
-#                 models.Products.company_id == current_company.id
-#             ).first()
-
-#             if not product or product.stock_quantity < sale.quantity:
-#                 raise HTTPException(
-#                     status_code=400,
-#                     detail=f"Insufficient stock for product ID {sale.pid}"
-#                 )
-
-#             # Update stock and mark sale as completed
-#             product.stock_quantity -= sale.quantity
-#             sale.status = "completed"
-
-#         # Complete transaction
-#         transaction.status = "completed"
-#         transaction.updated_at = datetime.utcnow()
-
-#         db.commit()
-
-#         return {
-#             "message": "Sale confirmed successfully",
-#             "transaction": {
-#                 "id": transaction.id,
-#                 "total_amount": transaction.total_amount,
-#                 "status": "completed"
-#             },
-#             "sales": [
-#                 {
-#                     "id": sale.id,
-#                     "product_id": sale.pid,
-#                     "quantity": sale.quantity,
-#                     "unit_price": sale.unit_price,
-#                     "total": sale.quantity * sale.unit_price
-#                 }
-#                 for sale in sales_items
-#             ]
-#         }
-
-#     except HTTPException as he:
-#         db.rollback()
-#         raise he
-#     except Exception as e:
-#         db.rollback()
-#         raise HTTPException(status_code=500, detail=str(e))
 
 # This is for cancelling a sale:    
 @app.post("/sales/cancel/{transaction_id}", response_model=schemas.TransactionCancelResponse)
@@ -1508,7 +1607,7 @@ def fetch_sales(
     try:
         sales = db.query(
             models.Sales,
-            models.Users.first_name,
+            models.Users.full_name,
             models.Products.product_name,
             models.Products.product_price
         ).join(
@@ -1639,14 +1738,14 @@ def update_sale(
 
         # Check stock availability
         stock_change = request.quantity - sale.quantity
-        if product.stock_quantity < stock_change:
+        if product.stock.stock_quantity < stock_change:
             raise HTTPException(status_code=400, detail="Insufficient stock")
 
         # Update sale and stock
         sale.quantity = request.quantity
         sale.unit_price = request.unit_price
         sale.pid = request.product_id
-        product.stock_quantity -= stock_change
+        product.stock.stock_quantity -= stock_change
 
         db.commit()
         
@@ -1689,7 +1788,7 @@ def delete_sale(
         ).first()
 
         if product:
-            product.stock_quantity += sale.quantity
+            product.stock.stock_quantity += sale.quantity
 
         # Delete sale
         db.delete(sale)
@@ -1968,7 +2067,7 @@ async def import_products(
                     # Update existing product
                     existing_product.product_price = row['product_price']
                     existing_product.selling_price = row['selling_price']
-                    existing_product.stock_quantity = row['stock_quantity']
+                    existing_product.stock.stock_quantity = row['stock_quantity']
                     existing_product.description = row.get('description')
                     existing_product.updated_at = datetime.utcnow()
                     existing_product.updated_by = current_user.id
@@ -1978,13 +2077,20 @@ async def import_products(
                         product_name=row['product_name'],
                         product_price=row['product_price'],
                         selling_price=row['selling_price'],
-                        stock_quantity=row['stock_quantity'],
                         description=row.get('description'),
                         company_id=current_company.id,
                         created_by=current_user.id
                     )
                     db.add(new_product)
-                
+                    db.flush()  # Ensure new_product.id is available
+
+                    # Create stock entry
+                    new_stock = models.ProductStock(
+                        product_id=new_product.id,
+                        stock_quantity=row['stock_quantity']
+                    )
+                    db.add(new_stock)
+
                 success_count += 1
             except Exception as e:
                 error_count += 1
@@ -2349,7 +2455,7 @@ def get_vendor(
                     "product_name": product.product_name,
                     "product_price": product.product_price,
                     "selling_price": product.selling_price,
-                    "stock_quantity": product.stock_quantity,
+                    "stock_quantity": product.stock.stock_quantity,
                     "created_at": product.created_at
                 }
                 for product in products
@@ -2489,21 +2595,13 @@ print("Access Token: ",get_access_token())
 
 
 # Start Company Routes >>   
-@app.post("/companies", response_model=schemas.CompanyResponse)
+@app.post("/companies", response_model=schemas.CompanyIDResponse)
 async def create_company(
     company: schemas.CompanyCreate,
     plan_id: int,  # Accept plan_id as a query parameter
-    current_user: schemas.UserResponse = Depends(get_current_user),
     db: Session = Depends(database.get_db)
 ):
     try:
-        # Check if user already has a company
-        if current_user.company_id:
-            raise HTTPException(
-                status_code=400,
-                detail="User already has a company associated"
-            )
-
         # Validate subscription plan
         plan = db.query(models.SubscriptionPlan).filter(
             models.SubscriptionPlan.id == plan_id
@@ -2511,14 +2609,13 @@ async def create_company(
         if not plan:
             raise HTTPException(status_code=404, detail="Subscription plan not found")
 
-        # Create new company
+        # Create new company without user context
         db_company = models.Company(
             name=company.name,
             phone=company.phone or "",
             email=company.email or "",
             location=company.location or "",
             description=company.description,
-            user_id=current_user.id,
             status="active"
         )
         
@@ -2526,12 +2623,6 @@ async def create_company(
         db.commit()
         db.refresh(db_company)
         
-        # Update the user's company_id and role
-        user = db.query(models.Users).filter(models.Users.id == current_user.id).first()
-        user.company_id = db_company.id
-        user.company_role = "owner"
-        db.commit()
-
         # Create a subscription for the company
         subscription = models.Subscription(
             company_id=db_company.id,
@@ -2543,7 +2634,10 @@ async def create_company(
         db.add(subscription)
         db.commit()
         
-        return db_company
+        # Log and return only the company ID
+        company_id = db_company.id
+        print(f"Created company with ID: {company_id}")
+        return {"id": company_id}
         
     except Exception as e:
         db.rollback()
@@ -2555,22 +2649,16 @@ async def create_company(
 
 @app.get("/companies/me", response_model=schemas.CompanyResponse)
 def get_my_company(
-    db: Session = Depends(database.get_db),
-    current_user: schemas.UserResponse = Depends(get_current_user)
+    db: Session = Depends(database.get_db)
 ):
     try:
-        # Try to find company by both user_id and company_id
-        company = db.query(models.Company).filter(
-            or_(
-                models.Company.user_id == current_user.id,
-                models.Company.id == current_user.company_id
-            )
-        ).first()
+        # Fetch the company without user context
+        company = db.query(models.Company).first()
         
         if not company:
             raise HTTPException(
                 status_code=404,
-                detail="No company found for this user"
+                detail="No company found"
             )
 
         return company
@@ -2586,20 +2674,18 @@ def get_my_company(
 @app.put("/companies/me", response_model=schemas.CompanyResponse)
 def update_my_company(
     company_update: schemas.CompanyUpdate,
-    db: Session = Depends(database.get_db),
-    current_user: schemas.UserResponse = Depends(get_current_user)
+    db: Session = Depends(database.get_db)
 ):
     try:
-        # Get active company
+        # Get active company without user context
         company = db.query(models.Company).filter(
-            models.Company.user_id == current_user.id,
             models.Company.status == "active"
         ).first()
         
         if not company:
             raise HTTPException(
                 status_code=404,
-                detail="You don't have an active company"
+                detail="No active company found"
             )
         
         # Update company fields
@@ -2628,17 +2714,9 @@ def update_my_company(
 @app.post("/subscription-plans", response_model=schemas.SubscriptionPlan)
 def create_subscription_plan(
     plan: schemas.SubscriptionPlanCreate,
-    db: Session = Depends(database.get_db),
-    current_user: schemas.UserResponse = Depends(get_current_user)
+    db: Session = Depends(database.get_db)
 ):
     try:
-        # Check admin permission
-        if not current_user.is_admin:
-            raise HTTPException(
-                status_code=403,
-                detail="Only administrators can create subscription plans"
-            )
-        
         # Check if plan name already exists
         existing_plan = db.query(models.SubscriptionPlan).filter(
             models.SubscriptionPlan.name == plan.name
@@ -2708,11 +2786,10 @@ def get_subscription_plan(
 @app.post("/subscriptions", response_model=schemas.SubscriptionResponse)
 def create_subscription(
     subscription: schemas.SubscriptionCreate,
-    db: Session = Depends(database.get_db),
-    current_user: schemas.UserResponse = Depends(get_current_user)
+    db: Session = Depends(database.get_db)
 ):
     try:
-        # Check if company exists and user has permission
+        # Check if company exists
         company = db.query(models.Company).filter(
             models.Company.id == subscription.company_id
         ).first()
@@ -2721,13 +2798,6 @@ def create_subscription(
             raise HTTPException(
                 status_code=404,
                 detail="Company not found"
-            )
-            
-        # Check if user has permission for this company
-        if company.user_id != current_user.id and not current_user.is_admin:
-            raise HTTPException(
-                status_code=403,
-                detail="You don't have permission to create subscriptions for this company"
             )
             
         # Check if plan exists
@@ -2759,8 +2829,7 @@ def create_subscription(
             plan_id=subscription.plan_id,
             start_date=datetime.utcnow(),
             end_date=datetime.utcnow() + timedelta(days=30),  # 30-day subscription
-            status="active",
-            created_by=current_user.id
+            status="active"
         )
         
         db.add(new_subscription)
@@ -2783,27 +2852,13 @@ def create_subscription(
 # Route for getting the current user's subscription:    
 @app.get("/subscriptions/me", response_model=schemas.Subscription)
 def get_my_subscription(
-    db: Session = Depends(database.get_db),
-    current_user: schemas.UserResponse = Depends(get_current_user)
+    db: Session = Depends(database.get_db)
 ):
     try:
-        # Get active company
-        company = db.query(models.Company).filter(
-            models.Company.user_id == current_user.id,
-            models.Company.status == "active"
-        ).first()
-        
-        if not company:
-            raise HTTPException(
-                status_code=404,
-                detail="You don't have an active company"
-            )
-        
         # Get active subscription with plan details
         subscription = db.query(models.Subscription)\
             .options(joinedload(models.Subscription.plan))\
             .filter(
-                models.Subscription.company_id == company.id,
                 models.Subscription.status == "active"
             )\
             .first()
@@ -3035,8 +3090,7 @@ async def subscribe_after_register(
             plan_id=subscription_data.plan_id,
             start_date=datetime.now(timezone.utc),
             end_date=datetime.now(timezone.utc) + timedelta(days=duration_days),
-            status="active",
-            created_by=subscription_data.user_id
+            status="active"
         )
         
         db.add(subscription)
@@ -3218,7 +3272,7 @@ def confirm_payment_and_create_sale(
                 )
 
             # Validate stock
-            if product.stock_quantity < item.quantity:
+            if product.stock.stock_quantity < item.quantity:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Insufficient stock for {product.product_name}"
@@ -3242,7 +3296,7 @@ def confirm_payment_and_create_sale(
             sales_records.append((sale_record, product))
 
             # Update product stock
-            product.stock_quantity -= item.quantity
+            product.stock.stock_quantity -= item.quantity
 
         # Create transaction record
         transaction = models.Transactions(
@@ -3294,8 +3348,7 @@ def confirm_payment_and_create_sale(
         raise he
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    
+        raise HTTPException(status_code=500, detail=str(e))    
 
 
 
@@ -3353,3 +3406,119 @@ def confirm_payment_and_create_sale(
 #     except Exception as e:
 #         db.rollback()
 #         raise HTTPException(status_code=500, detail=f"Error creating company with plan: {str(e)}")
+
+@app.get("/companies/{company_id}", response_model=schemas.CompanyResponse)
+def get_company_details(
+    company_id: int,
+    db: Session = Depends(database.get_db)
+):
+    try:
+        # Fetch the company by ID
+        company = db.query(models.Company).filter(models.Company.id == company_id).first()
+        
+        if not company:
+            raise HTTPException(
+                status_code=404,
+                detail="Company not found"
+            )
+
+        return company
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching company details: {str(e)}"
+        )
+
+
+
+# Create a company with a free trial    
+@app.post("/companies/free-trial", response_model=schemas.CompanyResponse)
+async def create_company_with_free_trial(
+    company_data: schemas.CompanyCreate,
+    db: Session = Depends(database.get_db)
+):
+    try:
+        # Check if a company with the same email already exists
+        existing_company = db.query(models.Company).filter(
+            models.Company.email == company_data.email
+        ).first()
+        if existing_company:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A company with this email already exists"
+            )
+
+        # Create the new company
+        new_company = models.Company(
+            name=company_data.name,
+            phone=company_data.phone,
+            email=company_data.email,
+            location=company_data.location,
+            description=company_data.description,
+            status="active"
+        )
+        db.add(new_company)
+        db.commit()
+        db.refresh(new_company)
+
+        # Assign a free trial subscription
+        free_trial_plan = db.query(models.SubscriptionPlan).filter(
+            models.SubscriptionPlan.name == "Free Trial"
+        ).first()
+        if not free_trial_plan:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Free trial plan not found"
+            )
+
+        free_trial_subscription = models.Subscription(
+            company_id=new_company.id,
+            plan_id=free_trial_plan.id,
+            start_date=datetime.utcnow(),
+            end_date=datetime.utcnow() + timedelta(days=1),  
+            status="active"
+        )
+        db.add(free_trial_subscription)
+        db.commit()
+
+        return new_company
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating company with free trial: {str(e)}"
+        )
+
+# Get free trial status for a company   
+@app.get("/companies/{company_id}/free-trial", response_model=schemas.FreeTrialResponse)
+async def get_free_trial_status(company_id: int, db: Session = Depends(database.get_db)):
+    try:
+        subscription = db.query(models.Subscription).filter(
+            models.Subscription.company_id == company_id,
+            models.Subscription.status == "active"
+        ).first()
+
+        if not subscription:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Active subscription not found"
+            )
+
+        now = datetime.utcnow()
+        if subscription.end_date < now:
+            return {"is_trial": False, "days_left": 0}  # Changed to days_left
+
+        remaining_time = subscription.end_date - now
+        days_left = remaining_time.days  # Calculate days left
+
+        return {"is_trial": True, "days_left": days_left}  # Changed to days_left
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving free trial status: {str(e)}"
+        )

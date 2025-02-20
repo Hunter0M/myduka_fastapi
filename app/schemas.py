@@ -13,37 +13,52 @@ from datetime import timedelta
 class UserBase(BaseModel):
     """المخطط الأساسي للمستخدم"""
     email: EmailStr
-    first_name: str
-    last_name: str
-    phone: str
+    full_name: str
+    # last_name: str
+    # phone: str
     is_admin: bool = False
 
-    @validator('phone')
-    def validate_phone(cls, v):
-        if not re.match(r'^\+?1?\d{9,15}$', v):
-            raise ValueError('Invalid phone number format')
-        return v
+    # @validator('phone')
+    # def validate_phone(cls, v):
+    #     if not re.match(r'^\+?1?\d{9,15}$', v):
+    #         raise ValueError('Invalid phone number format')
+    #     return v
 
 class UserCreate(BaseModel):
     username: str
     email: EmailStr
-    first_name: str
-    last_name: str
-    phone: str
+    full_name: str
     password: str
+    # confirm_password: str
+    
+    @validator('password')
+    def strong_password(cls, password: str) -> str:
+        if len(password) < 8:
+            raise ValueError('Password must be at least 8 characters long')
+        if not re.search(r"[A-Z]", password):
+            raise ValueError('Password must contain at least one uppercase letter')
+        if not re.search(r"[a-z]", password):
+            raise ValueError('Password must contain at least one lowercase letter')
+        if not re.search(r"[0-9]", password):
+            raise ValueError('Password must contain at least one digit')
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+            raise ValueError('Password must contain at least one special character')
+        return password
 
-    @validator('phone')
-    def validate_phone(cls, v):
-        if not re.match(r'^\+?1?\d{9,15}$', v):
-            raise ValueError('Invalid phone number format')
-        return v
+    # @validator('confirm_password', check_fields=False)
+    # def passwords_match(cls, confirm_password: str, values: dict) -> str:
+    #     password = values.get('password')
+    #     if password != confirm_password:
+    #         raise ValueError('Passwords do not match')
+    #     return confirm_password
+
 
 class UserUpdate(BaseModel):
     """مخطط تحديث المستخدم"""
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
+    full_name: Optional[str] = None
+    # last_name: Optional[str] = None
+    # phone: Optional[str] = None
     email: Optional[EmailStr] = None
-    phone: Optional[str] = None
     password: Optional[str] = None
     company_role: Optional[str] = None
 
@@ -62,18 +77,6 @@ class UserUpdate(BaseModel):
             return v.lower().strip()
         return v
 
-    @validator('first_name', 'last_name')
-    def validate_names(cls, v):
-        if v and not v.strip():
-            raise ValueError("Name cannot be empty")
-        return v.strip() if v else v
-
-    @validator('phone')
-    def validate_phone(cls, v):
-        if v and not re.match(r'^\+?1?\d{9,15}$', v):
-            raise ValueError('Invalid phone number format')
-        return v
-
     @validator('password')
     def validate_password(cls, v):
         if v and len(v) < 6:
@@ -89,17 +92,21 @@ class UserResponse(BaseModel):
     id: int
     # company_id: Optional[int] = None
     email: str
-    first_name: str
-    last_name: str
-    phone: str
+    full_name: str
     is_admin: bool
     hasCompany: bool 
+    hasUsedFreeTrial: bool
     company_role: Optional[str]
     created_at: datetime
     updated_at: Optional[datetime]
 
     class Config:
         from_attributes = True
+
+# Define a Pydantic model for the validation request
+class ValidationRequest(BaseModel):
+    username: str = None
+    email: str = None
 
 # New schema for user with detailed company info
 class UserWithCompany(UserResponse):
@@ -190,7 +197,7 @@ class ProductBase(BaseModel):
     description: Optional[str] = None
     product_price: int
     selling_price: int
-    stock_quantity: int
+    # stock_quantity: int
     image_url: Optional[str] = None
     company_id: Optional[int] = None
 
@@ -214,7 +221,7 @@ class ProductUpdate(BaseModel):
     description: Optional[str] = None
     product_price: Optional[int] = None
     selling_price: Optional[int] = None
-    stock_quantity: Optional[int] = None
+    # stock_quantity: Optional[int] = None
     image_url: Optional[str] = None
 
 # First, create a simplified vendor schema for product responses
@@ -235,7 +242,6 @@ class ProductResponse(BaseModel):
     product_name: str
     product_price: int
     selling_price: int
-    stock_quantity: int
     description: Optional[str] = None
     image_url: Optional[str] = None
     vendor_id: Optional[int] = None
@@ -669,13 +675,13 @@ class CompanyResponse(BaseModel):
     phone: str
     email: str
     location: str
-    user_id: int
+    user_id: Optional[int]
     status: str
     created_at: datetime
-    is_trial: bool = False  # Just add this single field
+    is_trial: bool = False
 
     class Config:
-        from_attributes = True
+        orm_mode = True
 
 class TrialStatusResponse(BaseModel):
     is_trial: bool
@@ -893,28 +899,28 @@ class CompanyCreateWithPlan(BaseModel):
     description: str
     plan_id: int
 
+class CompanyIDResponse(BaseModel):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+class ProductStockResponse(BaseModel):
+    id: int
+    product_id: int
+    stock_quantity: int
+    product_name: str
+    selling_price: float
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
+# Free Trial Response Schema    
+class FreeTrialResponse(BaseModel):
+    is_trial: bool
+    days_left: int
 
-
-
-
-
-
-# # Password Reset Schemas
-# class ForgotPasswordRequest(BaseModel):
-#     email: EmailStr
-#     base_url: str
-
-# class ForgotPasswordResponse(BaseModel):
-#     message: str
-
-# class ResetPasswordRequest(BaseModel):
-#     token: str
-#     new_password: constr(min_length=8)  # Ensures password is at least 8 characters
-
-# class ResetPasswordResponse(BaseModel):
-#     message: str
-
-
-
+    class Config:
+        from_attributes = True
